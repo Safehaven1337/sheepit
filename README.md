@@ -1,36 +1,41 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Sheepit 🐑
 
-## Getting Started
+Kostenloser Bildeditor im Browser – **ohne Login, ohne Upload, ohne Backend-Speicherung**. Alles läuft auf dem Gerät der Nutzer:innen.
 
-First, run the development server:
+## Start
 
 ```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+npm install
+npm run dev      # http://localhost:3000
+npm run build    # Production-Build (alle SEO-Seiten statisch vorgerendert)
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+`NEXT_PUBLIC_SITE_URL` setzen (Default `https://sheepit.app`) – wird für Canonicals, Sitemap und OG genutzt.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Architektur
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+| Bereich | Ort |
+| --- | --- |
+| Dokumentmodell (JSON, nicht-destruktiv) | `src/lib/editor/types.ts`, `defaults.ts` |
+| State + Undo/Redo (zustand, Snapshot-History mit Coalescing) | `src/lib/editor/store.ts` |
+| GPU-Entwicklung (WebGL2: Belichtung, Tonwerte, Kurven-LUT, HSL-Mixer, Color Grading, Klarheit, Dehaze, Schärfen, Entrauschen, Vignette, Korn) | `src/lib/editor/gl/` |
+| Compositing (Ebenen, Text, Formen, Zeichnen, Füllmethoden) | `src/lib/editor/render.ts` |
+| Privacy-Effekte (Verpixeln, Blur, Schwärzen, Milchglas, Rauschen; Rechteck/Ellipse/Pinsel, weiche Kante, Umkehren) | `src/lib/editor/effects.ts` |
+| Gesichtserkennung on-device (MediaPipe, self-hosted in `public/mediapipe` + `public/models`) | `src/lib/editor/faces.ts` |
+| Looks / Filter-Presets | `src/lib/editor/looks.ts` |
+| `.sheepit` Projektformat + Export (JPG/PNG/WebP/AVIF) | `src/lib/editor/project.ts` |
+| Editor-UI | `src/components/editor/` |
+| SEO-Tool-Seiten (Inhalte + Editor-Presets) | `src/lib/seo/tools.ts` → `src/app/[tool]/page.tsx` |
 
-## Learn More
+### `.sheepit`-Format
+ZIP-Archiv mit `manifest.json`, `document.json` (alle Bearbeitungen), `assets/<id>.<ext>` (Originalbilder) und `preview.jpg`.
 
-To learn more about Next.js, take a look at the following resources:
+### Neue SEO-Seite hinzufügen
+Einen Eintrag in `TOOLS` (`src/lib/seo/tools.ts`) ergänzen – Seite, Sitemap, Footer-Links, JSON-LD (HowTo, FAQ, Breadcrumb) und Editor-Preset entstehen automatisch.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## UI-Bibliotheken
+shadcn/ui (Base UI), Magic UI (Bento, Marquee, Border Beam, Shimmer Button, Number Ticker, Dot Pattern, Magic Card), Aceternity UI (Spotlight, Compare), shitui (Split FAQ).
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
-
-## Deploy on Vercel
-
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
-
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+## Vor dem Livegang
+- Impressum & Datenschutz (`src/app/impressum`, `src/app/datenschutz`) sind Platzhalter.
+- Werbung: Consent-Banner (TCF) nötig, sobald Ads eingebunden werden.
