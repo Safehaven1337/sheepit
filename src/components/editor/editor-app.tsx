@@ -16,6 +16,7 @@ import { PropertiesPanel } from "./properties-panel"
 import { LayersPanel } from "./layers-panel"
 import { ExportDialog } from "./export-dialog"
 import { NewDocDialog } from "./new-doc-dialog"
+import { ContextMenuHost } from "./context-menu"
 import { MenuBar, type UiCommand } from "./menu-bar"
 import { OptionsBar } from "./options-bar"
 import { Toolbar, TOOLS } from "./toolbar"
@@ -37,6 +38,7 @@ import { takePendingFile, ACCEPT } from "@/lib/editor/handoff"
 import { presetBySlug, type EditorPreset } from "@/lib/seo/tools"
 import { saveProject, downloadBlob, type ExportFormat } from "@/lib/editor/project"
 import { docSize } from "@/lib/editor/render"
+import { targetOf } from "@/lib/editor/target"
 import { BASE_ID, type Layer } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
@@ -105,9 +107,10 @@ export function EditorApp() {
   React.useEffect(() => {
     const s = useEditor.getState()
     if (!selectedId) return
-    if (selectedId === BASE_ID) {
-      if (s.panelTab === "props" && s.doc.baseAssetId) s.setPanelTab("adjust")
-    } else if (s.panelTab !== "props") s.setPanelTab("props")
+    // background → adjustments; layers keep the current tab (adjustments now work per layer)
+    if (selectedId === BASE_ID && s.panelTab === "props" && s.doc.baseAssetId) s.setPanelTab("adjust")
+    const l = s.doc.layers.find((x) => x.id === selectedId)
+    if (l?.type === "effect") s.setPanelTab("props")
   }, [selectedId])
 
   React.useEffect(() => {
@@ -258,12 +261,13 @@ export function EditorApp() {
   }, [])
 
   const s = useEditor.getState
+  const hasTarget = !!targetOf(doc, selectedId)
   const tabs: { id: PanelTab; label: string; disabled?: boolean }[] = [
-    { id: "adjust", label: "Anpassen", disabled: !doc.baseAssetId },
-    { id: "looks", label: "Looks", disabled: !doc.baseAssetId },
+    { id: "adjust", label: "Anpassen", disabled: !hasTarget },
+    { id: "looks", label: "Looks", disabled: !hasTarget },
     { id: "props", label: "Eigenschaften" },
   ]
-  const tab = !doc.baseAssetId && panelTab !== "props" ? "props" : panelTab
+  const tab = !hasTarget && panelTab !== "props" ? "props" : panelTab
 
   return (
     <div className="fixed inset-0 flex flex-col bg-[oklch(0.12_0.006_285)] text-foreground">
@@ -438,6 +442,7 @@ export function EditorApp() {
 
       <ExportDialog open={exportOpen} onOpenChange={setExportOpen} initial={exportInit} />
       <NewDocDialog open={newOpen} onOpenChange={setNewOpen} />
+      <ContextMenuHost />
     </div>
   )
 }

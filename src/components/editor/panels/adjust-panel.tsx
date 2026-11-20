@@ -11,6 +11,21 @@ import { Switch } from "@/components/ui/switch"
 import { useEditor } from "@/lib/editor/store"
 import { HSL_CHANNELS, type Adjustments, type HslChannel } from "@/lib/editor/types"
 import { renderDoc, invalidateRenderCache, docSize } from "@/lib/editor/render"
+import { currentTarget, patchDevelop, readDevelop, targetOf, type AdjTarget } from "@/lib/editor/target"
+import { defaultAdjustments } from "@/lib/editor/defaults"
+import { Layers, ImageIcon } from "lucide-react"
+
+/** shows which layer the adjustments apply to */
+export function TargetBadge({ target }: { target: AdjTarget }) {
+  return (
+    <div className="flex items-center gap-2 rounded-lg bg-[#3b9dff]/10 px-2.5 py-1.5 text-[11.5px] text-[#9cc9ff] ring-1 ring-[#3b9dff]/25">
+      {target.kind === "base" ? <ImageIcon className="size-3.5" /> : <Layers className="size-3.5" />}
+      <span className="truncate">
+        Wirkt auf: <strong className="font-semibold text-foreground">{target.kind === "base" ? "Hintergrund (Foto)" : target.name}</strong>
+      </span>
+    </div>
+  )
+}
 import { cn } from "@/lib/utils"
 
 type NumKey = { [K in keyof Adjustments]: Adjustments[K] extends number ? K : never }[keyof Adjustments]
@@ -36,15 +51,18 @@ const HSL_LABEL: Record<HslChannel, string> = {
   magenta: "Magenta",
 }
 
+/** adjustments of the current target (background photo or active layer) */
 export function useAdj() {
-  const a = useEditor((s) => s.doc.adjustments)
-  const patch = useEditor((s) => s.patch)
+  const doc = useEditor((s) => s.doc)
+  const selectedId = useEditor((s) => s.selectedId)
+  const t = targetOf(doc, selectedId)
+  const a = t ? readDevelop(doc, t).adjustments : doc.adjustments
   const set = React.useCallback(
-    <K extends keyof Adjustments>(k: K, v: Adjustments[K], key?: string) =>
-      patch((d) => {
-        d.adjustments[k] = v
-      }, key ?? `adj:${String(k)}`),
-    [patch],
+    <K extends keyof Adjustments>(k: K, v: Adjustments[K], key?: string) => {
+      const target = currentTarget()
+      if (target) patchDevelop(target, (d) => void (d.adjustments[k] = v), key ?? `adj:${String(k)}`)
+    },
+    [],
   )
   return [a, set] as const
 }
@@ -86,9 +104,19 @@ function S({
 
 export function autoEnhance() {
   const s = useEditor.getState()
-  if (!s.doc.baseAssetId) return
+  const t = currentTarget()
+  if (!t) return
   const { w, h } = docSize(s.doc)
-  const c = renderDoc({ ...s.doc, layers: [] }, s.assets, { scale: Math.min(1, 400 / Math.max(w, h)), original: true })
+  const scale = Math.min(1, 400 / Math.max(w, h))
+  const layer = t.kind === "layer" ? s.doc.layers.find((l) => l.id === t.id) : null
+  // analyse the target alone, without its current adjustments
+  const c = layer
+    ? renderDoc(
+        { ...s.doc, layers: [{ ...layer, adjustments: undefined, look: null, opacity: 1, blend: "source-over", visible: true }] },
+        s.assets,
+        { scale, skipBase: true, background: null },
+      )
+    : renderDoc({ ...s.doc, layers: [] }, s.assets, { scale, original: true })
   invalidateRenderCache()
   const hist = computeHistogram(c, 400)
   const pct = (p: number) => {
@@ -110,7 +138,7 @@ export function autoEnhance() {
   }
   const cast = n ? (rs - bs) / n / 255 : 0
   const exposure = Math.max(-1.5, Math.min(1.5, Math.log2(0.46 / Math.max(0.05, mid)) * 0.7))
-  s.patch((d) => {
+  patchDevelop(t, (d) => {
     const A = d.adjustments
     A.exposure = Math.round(exposure * 100) / 100
     A.blacks = Math.round(Math.max(-70, Math.min(30, -lo * 300 + 4)))
@@ -127,25 +155,37 @@ export function autoEnhance() {
 export function AdjustPanel() {
   const [a, set] = useAdj()
   const [hslTab, setHslTab] = React.useState<"hue" | "sat" | "lum">("sat")
-  const resetAdjustments = useEditor((s) => s.resetAdjustments)
-  const hasImage = useEditor((s) => !!s.doc.baseAssetId)
+  const doc = useEditor((s) => s.doc)
+  const selectedId = useEditor((s) => s.selectedId)
+  const target = React.useMemo(() => targetOf(doc, selectedId), [doc, selectedId])
 
-  if (!hasImage)
+  if (!target)
     return (
       <p className="p-4 text-sm text-muted-foreground">
-        Anpassungen wirken auf ein Foto. Öffne ein Bild, um Belichtung, Farben und Details zu bearbeiten.
+        Wähle eine Ebene oder öffne ein Foto, um Belichtung, Farben und Details anzupassen.
       </p>
     )
 
   return (
     <div>
       <div className="grid gap-2 px-4 pt-4 pb-3">
+        <TargetBadge target={target} />
         <Histogram />
         <div className="flex gap-2">
           <Button size="sm" className="flex-1" onClick={autoEnhance}>
             <Wand2 /> Auto
           </Button>
-          <Button size="sm" variant="outline" onClick={resetAdjustments}>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() =>
+              patchDevelop(target, (d) => {
+                d.adjustments = defaultAdjustments()
+                d.look = null
+                d.lookAmount = 1
+              })
+            }
+          >
             <RotateCcw /> Zurücksetzen
           </Button>
         </div>

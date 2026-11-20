@@ -129,6 +129,11 @@ interface LayerBase {
   blend: BlendMode
   /** erase operations (eraser tool, "delete selection") applied to this layer only */
   mask?: Stroke[]
+  /** per-layer photo adjustments (Lightroom-style develop) */
+  adjustments?: Adjustments
+  /** per-layer look preset */
+  look?: string | null
+  lookAmount?: number
 }
 
 export interface ImageLayer extends LayerBase {

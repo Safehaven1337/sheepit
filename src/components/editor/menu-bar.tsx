@@ -105,9 +105,9 @@ export function MenuBar() {
     { label: "Frei transformieren", kbd: "Strg+T", run: () => switchTool("move"), disabled: !layerSel },
   ]
   const image: Item[] = [
-    { label: "Auto-Verbessern", kbd: "Strg+Umschalt+L", run: autoEnhance, disabled: !hasPhoto },
-    { label: "Anpassungen …", run: () => st().setPanelTab("adjust"), disabled: !hasPhoto },
-    { label: "Looks & Filter …", run: () => st().setPanelTab("looks"), disabled: !hasPhoto },
+    { label: "Auto-Verbessern (aktive Ebene)", kbd: "Strg+Umschalt+L", run: autoEnhance, disabled: !ready },
+    { label: "Anpassungen …", run: () => st().setPanelTab("adjust"), disabled: !ready },
+    { label: "Looks & Filter …", run: () => st().setPanelTab("looks"), disabled: !ready },
     "-",
     { label: "90° im Uhrzeigersinn drehen", run: () => rotate90(1), disabled: !hasPhoto },
     { label: "90° gegen den Uhrzeigersinn", run: () => rotate90(-1), disabled: !hasPhoto },

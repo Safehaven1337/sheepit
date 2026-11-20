@@ -5,34 +5,65 @@ import { Check } from "lucide-react"
 import { AdjustSlider } from "../adjust-slider"
 import { useEditor } from "@/lib/editor/store"
 import { LOOKS } from "@/lib/editor/looks"
-import { docSize, renderDoc } from "@/lib/editor/render"
+import { aabb, docSize, invalidateRenderCache, layerBounds, renderDoc } from "@/lib/editor/render"
+import { patchDevelop, readDevelop, targetOf } from "@/lib/editor/target"
+import { TargetBadge } from "./adjust-panel"
 import { defaultAdjustments } from "@/lib/editor/defaults"
 import { cn } from "@/lib/utils"
 
 export function LooksPanel() {
   const doc = useEditor((s) => s.doc)
   const assets = useEditor((s) => s.assets)
-  const patch = useEditor((s) => s.patch)
-  const [thumbs, setThumbs] = React.useState<Record<string, string>>({})
-  const geoKey = JSON.stringify(doc.geometry) + doc.baseAssetId
+  const selectedId = useEditor((s) => s.selectedId)
+  const target = targetOf(doc, selectedId)
+  const dev = target ? readDevelop(doc, target) : null
+  const [thumbs, setThumbs] = React.useState<{ key: string; urls: Record<string, string> }>({ key: "", urls: {} })
+  const layer = target?.kind === "layer" ? doc.layers.find((l) => l.id === target.id) : null
+  // thumbnails only depend on the target's pixels, not on its current adjustments
+  const srcKey =
+    target?.kind === "layer" && layer
+      ? `L:${JSON.stringify({ ...layer, adjustments: null, look: null, lookAmount: null, opacity: 1, name: "" })}`
+      : `B:${JSON.stringify(doc.geometry)}${doc.baseAssetId}`
 
   React.useEffect(() => {
-    if (!doc.baseAssetId) return
+    if (!target) return
     let cancelled = false
     const { w, h } = docSize(doc)
-    const scale = Math.min(1, 168 / Math.min(w, h))
-    const base = { ...doc, layers: [], adjustments: defaultAdjustments() }
     const ids = ["none", ...LOOKS.map((l) => l.id)]
+    let render: (id: string) => HTMLCanvasElement
+    if (layer) {
+      const box = layerBounds(layer)
+      const r = box ? aabb(box) : { x: 0, y: 0, w, h }
+      const scale = Math.min(1, 168 / Math.max(1, Math.min(r.w, r.h)))
+      render = (id) => {
+        const l = { ...layer, adjustments: undefined, look: id === "none" ? null : id, lookAmount: 1, opacity: 1, blend: "source-over" as const, visible: true }
+        const c = renderDoc({ ...doc, layers: [l] }, assets, { scale, skipBase: true, background: null })
+        const out = document.createElement("canvas")
+        out.width = Math.max(1, Math.round(r.w * scale))
+        out.height = Math.max(1, Math.round(r.h * scale))
+        const x = out.getContext("2d")!
+        x.fillStyle = "#2a2a2e"
+        x.fillRect(0, 0, out.width, out.height)
+        x.drawImage(c, r.x * scale, r.y * scale, out.width, out.height, 0, 0, out.width, out.height)
+        return out
+      }
+    } else {
+      const scale = Math.min(1, 168 / Math.min(w, h))
+      const base = { ...doc, layers: [], adjustments: defaultAdjustments() }
+      render = (id) => renderDoc({ ...base, look: id === "none" ? null : id, lookAmount: 1 }, assets, { scale })
+    }
+    const urls: Record<string, string> = {}
     let i = 0
     const step = () => {
-      if (cancelled || i >= ids.length) {
+      if (cancelled) return
+      if (i >= ids.length) {
+        invalidateRenderCache()
         useEditor.getState().bump()
         return
       }
       const id = ids[i++]
-      const c = renderDoc({ ...base, look: id === "none" ? null : id, lookAmount: 1 }, assets, { scale })
-      const url = c.toDataURL("image/jpeg", 0.75)
-      setThumbs((t) => ({ ...t, [id]: url }))
+      urls[id] = render(id).toDataURL("image/jpeg", 0.75)
+      setThumbs({ key: srcKey, urls: { ...urls } })
       setTimeout(step, 0)
     }
     step()
@@ -40,29 +71,38 @@ export function LooksPanel() {
       cancelled = true
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [geoKey, assets])
+  }, [srcKey, assets])
 
-  if (!doc.baseAssetId) return <p className="p-4 text-sm text-muted-foreground">Öffne ein Foto, um Looks anzuwenden.</p>
+  if (!target || !dev)
+    return <p className="p-4 text-sm text-muted-foreground">Wähle eine Ebene oder öffne ein Foto, um Looks anzuwenden.</p>
+
+  const urls = thumbs.key === srcKey ? thumbs.urls : {}
+  const setLook = (id: string | null) =>
+    patchDevelop(target, (d) => {
+      if (d.look !== id) d.lookAmount = 1
+      d.look = id
+    })
 
   const groups = [...new Set(LOOKS.map((l) => l.group))]
 
   return (
     <div className="grid gap-4 p-4">
+      <TargetBadge target={target} />
       <AdjustSlider
         label="Intensität"
-        value={Math.round(doc.lookAmount * 100)}
+        value={Math.round(dev.lookAmount * 100)}
         min={0}
         max={100}
         neutral={100}
-        disabled={!doc.look}
+        disabled={!dev.look}
         format={(v) => `${v}%`}
-        onChange={(v) => patch((d) => void (d.lookAmount = v / 100), "look:amount")}
+        onChange={(v) => patchDevelop(target, (d) => void (d.lookAmount = v / 100), "look:amount")}
       />
       <LookTile
         name="Original"
-        src={thumbs.none}
-        active={!doc.look}
-        onClick={() => patch((d) => void (d.look = null))}
+        src={urls.none}
+        active={!dev.look}
+        onClick={() => setLook(null)}
         wide
       />
       {groups.map((g) => (
@@ -73,14 +113,9 @@ export function LooksPanel() {
               <LookTile
                 key={l.id}
                 name={l.name}
-                src={thumbs[l.id]}
-                active={doc.look === l.id}
-                onClick={() =>
-                  patch((d) => {
-                    if (d.look !== l.id) d.lookAmount = 1
-                    d.look = l.id
-                  })
-                }
+                src={urls[l.id]}
+                active={dev.look === l.id}
+                onClick={() => setLook(l.id)}
               />
             ))}
           </div>

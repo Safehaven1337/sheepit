@@ -8,6 +8,7 @@ import { newEffect, newShape, newText, uid } from "@/lib/editor/defaults"
 import { ensureFont, fontFamilyFor } from "@/lib/editor/fonts"
 import { finishTextEdit } from "@/lib/editor/actions"
 import { ensurePaintLayer, selectionPolygon } from "@/lib/editor/ops"
+import { openContextMenu } from "./context-menu"
 import { BASE_ID, type Layer, type SelectionShape, type SheepDoc, type Stroke, type TextLayer } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
@@ -294,6 +295,8 @@ export function Viewport({ className }: { className?: string }) {
       gesture.current = { kind: "pinch", d0: Math.hypot(a.x - b.x, a.y - b.y), z0: z, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } }
       return
     }
+    // right button is handled by the context menu
+    if (e.button === 2) return
     if (e.button === 1 || spaceDown || tool === "hand") {
       gesture.current = { kind: "pan", sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y }
       setPanning(true)
@@ -674,6 +677,30 @@ export function Viewport({ className }: { className?: string }) {
     setPanning(false)
   }
 
+  /** Right-click: brush settings for painting tools, otherwise a menu for what is under the cursor. */
+  const onContextMenu = (e: React.MouseEvent) => {
+    e.preventDefault()
+    if (cropMode) return
+    const s = st()
+    if (s.editingText) finishTextEdit()
+    const at = { x: e.clientX, y: e.clientY }
+    if (tool === "brush" || tool === "eraser") return openContextMenu({ ...at, kind: tool })
+    if (tool === "privacy" && (privacy.region === "brush" || privacy.erase)) return openContextMenu({ ...at, kind: "privacy-brush" })
+    const p = toDoc(e.clientX, e.clientY)
+    if (selection && (tool === "select" || (!selection.inverted && pointInPoly(p, selectionPolygon(selection))) || selection.inverted))
+      return openContextMenu({ ...at, kind: "selection" })
+    const under = topLayerAt(p)
+    if (under) {
+      s.select(under.id)
+      return openContextMenu({ ...at, kind: "layer" })
+    }
+    if (doc.baseAssetId) {
+      s.select(BASE_ID)
+      return openContextMenu({ ...at, kind: "base" })
+    }
+    openContextMenu({ ...at, kind: "canvas" })
+  }
+
   const onDoubleClick = (e: React.MouseEvent) => {
     if (tool !== "move" && tool !== "text") return
     const p = toDoc(e.clientX, e.clientY)
@@ -724,7 +751,7 @@ export function Viewport({ className }: { className?: string }) {
         setHoverId(null)
       }}
       onDoubleClick={onDoubleClick}
-      onContextMenu={(e) => e.preventDefault()}
+      onContextMenu={onContextMenu}
       data-viewport
     >
       <div

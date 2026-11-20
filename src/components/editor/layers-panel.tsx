@@ -23,6 +23,7 @@ import { deleteSelectedLayer, flattenImage, mergeDown, newLayer, rasterizeLayer 
 import { BASE_ID, type BlendMode, type Layer, type SheepDoc } from "@/lib/editor/types"
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu"
 import { IconBtn, NumberField } from "./controls"
+import { openContextMenu } from "./context-menu"
 import { cn } from "@/lib/utils"
 
 export const BLENDS: { v: BlendMode; l: string }[] = [
@@ -154,6 +155,11 @@ export function LayersPanel() {
               }}
               onDragEnd={() => setDrag(null)}
               onClick={() => s().select(l.id)}
+              onContextMenu={(e) => {
+                e.preventDefault()
+                s().select(l.id)
+                openContextMenu({ x: e.clientX, y: e.clientY, kind: "layer" })
+              }}
               onDoubleClick={() => setRenaming(l.id)}
               className={cn(
                 "group relative flex h-12 cursor-default items-center gap-2 rounded-lg px-1.5 text-[12.5px] text-muted-foreground transition hover:bg-muted/60",
@@ -226,6 +232,12 @@ export function LayersPanel() {
         {(doc.baseAssetId || doc.background) && (
           <div
             onClick={() => s().select(doc.baseAssetId ? BASE_ID : null)}
+            onContextMenu={(e) => {
+              e.preventDefault()
+              if (!doc.baseAssetId) return
+              s().select(BASE_ID)
+              openContextMenu({ x: e.clientX, y: e.clientY, kind: "base" })
+            }}
             onDragOver={(e) => {
               e.preventDefault()
               if (drag && drag.over !== n) setDrag({ ...drag, over: n })
