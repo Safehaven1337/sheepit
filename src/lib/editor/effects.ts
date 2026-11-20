@@ -44,6 +44,7 @@ function blurLine(src: Uint8ClampedArray, dst: Uint8ClampedArray, w: number, h: 
 }
 
 export function strokeBounds(strokes: Stroke[]) {
+  if (strokes.some((s) => s.poly && s.invert)) return { x: -1e5, y: -1e5, w: 2e5, h: 2e5 }
   let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
   for (const s of strokes) {
     const hs = s.size / 2
@@ -58,25 +59,72 @@ export function strokeBounds(strokes: Stroke[]) {
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
 }
 
+/**
+ * Draws one paint/erase operation. Caller sets fill/stroke style and composite op.
+ * Supports soft brushes (hardness), per-stroke opacity and filled polygons
+ * (selection fill / delete, optionally inverted).
+ */
 export function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, scale: number) {
   const p = s.points
-  ctx.lineCap = "round"
-  ctx.lineJoin = "round"
-  ctx.lineWidth = s.size * scale
-  ctx.beginPath()
-  if (p.length === 2) {
-    ctx.arc(p[0] * scale, p[1] * scale, (s.size * scale) / 2, 0, Math.PI * 2)
-    ctx.fill()
+  if (!p.length) return
+  ctx.save()
+  if (s.alpha !== undefined) ctx.globalAlpha *= s.alpha
+  if (s.poly) {
+    ctx.beginPath()
+    if (s.invert) ctx.rect(-1e5, -1e5, 2e5, 2e5)
+    ctx.moveTo(p[0] * scale, p[1] * scale)
+    for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i] * scale, p[i + 1] * scale)
+    ctx.closePath()
+    ctx.fill(s.invert ? "evenodd" : "nonzero")
+    ctx.restore()
     return
   }
-  ctx.moveTo(p[0] * scale, p[1] * scale)
-  for (let i = 2; i < p.length - 2; i += 2) {
-    const mx = ((p[i] + p[i + 2]) / 2) * scale
-    const my = ((p[i + 1] + p[i + 3]) / 2) * scale
-    ctx.quadraticCurveTo(p[i] * scale, p[i + 1] * scale, mx, my)
+  const hard = s.hardness ?? 1
+  const soft = hard < 0.98
+  let off = 0
+  let width = s.size * scale
+  if (soft) {
+    // soft edge via an offset shadow (works in every browser, unlike ctx.filter)
+    off = 1e5
+    const col = typeof ctx.strokeStyle === "string" ? ctx.strokeStyle : "#000"
+    ctx.shadowColor = col
+    ctx.shadowBlur = Math.max(0.5, s.size * scale * (1 - hard) * 0.55)
+    ctx.shadowOffsetX = off
+    width = Math.max(0.5, s.size * scale * (0.35 + 0.65 * hard))
   }
-  ctx.lineTo(p[p.length - 2] * scale, p[p.length - 1] * scale)
+  const X = (i: number) => p[i] * scale - off
+  const Y = (i: number) => p[i + 1] * scale
+  ctx.lineCap = "round"
+  ctx.lineJoin = "round"
+  ctx.lineWidth = width
+  ctx.beginPath()
+  if (p.length === 2) {
+    ctx.arc(X(0), Y(0), width / 2, 0, Math.PI * 2)
+    ctx.fill()
+    ctx.restore()
+    return
+  }
+  ctx.moveTo(X(0), Y(0))
+  for (let i = 2; i < p.length - 2; i += 2) {
+    const mx = (X(i) + X(i + 2)) / 2
+    const my = (Y(i) + Y(i + 2)) / 2
+    ctx.quadraticCurveTo(X(i), Y(i), mx, my)
+  }
+  ctx.lineTo(X(p.length - 2), Y(p.length - 2))
   ctx.stroke()
+  ctx.restore()
+}
+
+/** Applies erase operations (layer mask) onto a buffer in place. */
+export function applyMask(ctx: CanvasRenderingContext2D, mask: Stroke[] | undefined, scale: number) {
+  if (!mask?.length) return
+  ctx.save()
+  ctx.setTransform(1, 0, 0, 1, 0, 0)
+  ctx.globalCompositeOperation = "destination-out"
+  ctx.fillStyle = "#000"
+  ctx.strokeStyle = "#000"
+  for (const m of mask) drawStroke(ctx, m, scale)
+  ctx.restore()
 }
 
 /** Paints the effect region mask (white = affected) into a full-size canvas. */

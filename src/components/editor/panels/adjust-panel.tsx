@@ -84,7 +84,7 @@ function S({
   )
 }
 
-function autoEnhance() {
+export function autoEnhance() {
   const s = useEditor.getState()
   if (!s.doc.baseAssetId) return
   const { w, h } = docSize(s.doc)

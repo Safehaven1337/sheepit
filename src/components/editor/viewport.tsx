@@ -1,11 +1,14 @@
 "use client"
 
 import * as React from "react"
+import { toast } from "sonner"
 import { useEditor } from "@/lib/editor/store"
-import { docSize, layerBounds, measureText, renderDoc, rotatedSize, textFont } from "@/lib/editor/render"
-import { newDraw, newEffect, newShape, newText, uid } from "@/lib/editor/defaults"
+import { docSize, layerBounds, measureText, remapBaseMask, renderDoc, textFont } from "@/lib/editor/render"
+import { newEffect, newShape, newText, uid } from "@/lib/editor/defaults"
 import { ensureFont, fontFamilyFor } from "@/lib/editor/fonts"
-import type { Layer, SheepDoc, TextLayer } from "@/lib/editor/types"
+import { finishTextEdit } from "@/lib/editor/actions"
+import { ensurePaintLayer, selectionPolygon } from "@/lib/editor/ops"
+import { BASE_ID, type Layer, type SelectionShape, type SheepDoc, type Stroke, type TextLayer } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
 type Pt = { x: number; y: number }
@@ -23,16 +26,30 @@ function hit(b: Box, p: Pt, pad = 0) {
   return Math.abs(l.x) <= Math.abs(b.w) / 2 + pad && Math.abs(l.y) <= Math.abs(b.h) / 2 + pad
 }
 
+function pointInPoly(p: Pt, pts: number[]) {
+  let inside = false
+  for (let i = 0, j = pts.length - 2; i < pts.length; j = i, i += 2) {
+    const xi = pts[i], yi = pts[i + 1], xj = pts[j], yj = pts[j + 1]
+    if (yi > p.y !== yj > p.y && p.x < ((xj - xi) * (p.y - yi)) / (yj - yi) + xi) inside = !inside
+  }
+  return inside
+}
+
 type Gesture =
   | { kind: "pan"; sx: number; sy: number; px: number; py: number }
   | { kind: "pinch"; d0: number; z0: number; mid: Pt }
-  | { kind: "move"; id: string; start: Pt; orig: Layer; key: string }
+  | { kind: "move"; id: string; start: Pt; orig: Layer; key: string; moved: boolean }
   | { kind: "resize"; id: string; hx: number; hy: number; orig: Layer; box: Box; key: string; keepAspect: boolean }
   | { kind: "endpoint"; id: string; end: 0 | 1; orig: Layer; key: string }
-  | { kind: "rotate"; id: string; center: Pt; orig: Layer; key: string }
+  | { kind: "rotate"; id: string; center: Pt; key: string }
   | { kind: "create"; id: string | null; start: Pt; key: string; what: "effect" | "shape" }
-  | { kind: "brush"; id: string; key: string; last: Pt }
+  | { kind: "paint"; target: string; key: string; last: Pt; into: "strokes" | "mask" | "base" }
+  | { kind: "select"; start: Pt; points: number[]; moved: boolean }
+  | { kind: "moveSelection"; start: Pt; orig: SelectionShape }
   | { kind: "crop"; mode: "move" | "resize"; hx: number; hy: number; start: Pt; orig: { x: number; y: number; w: number; h: number } }
+
+/** last brush point – shift+click draws a straight line from here (Photoshop) */
+let lastPaintPoint: Pt | null = null
 
 export function Viewport({ className }: { className?: string }) {
   const doc = useEditor((s) => s.doc)
@@ -45,7 +62,10 @@ export function Viewport({ className }: { className?: string }) {
   const crop = useEditor((s) => s.crop)
   const editingText = useEditor((s) => s.editingText)
   const privacy = useEditor((s) => s.privacy)
-  const drawSet = useEditor((s) => s.draw)
+  const brush = useEditor((s) => s.brush)
+  const eraser = useEditor((s) => s.eraser)
+  const selection = useEditor((s) => s.selection)
+  const selectMode = useEditor((s) => s.selectMode)
 
   const containerRef = React.useRef<HTMLDivElement>(null)
   const stageRef = React.useRef<HTMLDivElement>(null)
@@ -55,20 +75,23 @@ export function Viewport({ className }: { className?: string }) {
   const [pan, setPan] = React.useState({ x: 0, y: 0 })
   const [box, setBox] = React.useState({ w: 0, h: 0 })
   const [spaceDown, setSpaceDown] = React.useState(false)
+  const [altDown, setAltDown] = React.useState(false)
   const [cursor, setCursor] = React.useState<Pt | null>(null)
   const [panning, setPanning] = React.useState(false)
+  const [hoverId, setHoverId] = React.useState<string | null>(null)
+  const [lasso, setLasso] = React.useState<number[] | null>(null)
 
   const cropMode = tool === "crop" && !!doc.baseAssetId
   const viewDoc: SheepDoc = React.useMemo(
-    () =>
-      cropMode
-        ? { ...doc, geometry: { ...doc.geometry, crop: { x: 0, y: 0, w: 1, h: 1 } }, layers: [] }
-        : doc,
+    () => {
+      if (!cropMode) return doc
+      const full = { ...doc, geometry: { ...doc.geometry, crop: { x: 0, y: 0, w: 1, h: 1 } }, layers: [] }
+      return { ...full, baseMask: remapBaseMask(doc, full) }
+    },
     [doc, cropMode],
   )
   const { w: DW, h: DH } = docSize(viewDoc)
 
-  // container size
   React.useEffect(() => {
     const el = containerRef.current
     if (!el) return
@@ -96,9 +119,7 @@ export function Viewport({ className }: { className?: string }) {
   React.useEffect(() => {
     const texts = doc.layers.filter((l): l is TextLayer => l.type === "text")
     if (!texts.length) return
-    Promise.all(texts.map((t) => ensureFont(t.fontFamily, t.fontWeight, t.italic))).then(() =>
-      useEditor.getState().bump(),
-    )
+    Promise.all(texts.map((t) => ensureFont(t.fontFamily, t.fontWeight, t.italic))).then(() => useEditor.getState().bump())
   }, [doc.layers])
 
   // render (rAF-throttled)
@@ -117,20 +138,34 @@ export function Viewport({ className }: { className?: string }) {
     return () => cancelAnimationFrame(id)
   }, [viewDoc, assets, compare, renderScale, renderTick, editingText])
 
-  // space to pan
+  // modifier keys
   React.useEffect(() => {
+    const isField = (t: EventTarget | null) => !!(t as HTMLElement)?.closest?.("input,textarea,select,[contenteditable]")
     const down = (e: KeyboardEvent) => {
-      if (e.code === "Space" && !(e.target as HTMLElement).closest("input,textarea,[contenteditable]")) {
+      if (e.code === "Space" && !isField(e.target)) {
         setSpaceDown(true)
         e.preventDefault()
       }
+      if (e.key === "Alt") {
+        setAltDown(true)
+        e.preventDefault()
+      }
     }
-    const up = (e: KeyboardEvent) => e.code === "Space" && setSpaceDown(false)
+    const up = (e: KeyboardEvent) => {
+      if (e.code === "Space") setSpaceDown(false)
+      if (e.key === "Alt") setAltDown(false)
+    }
+    const blur = () => {
+      setSpaceDown(false)
+      setAltDown(false)
+    }
     window.addEventListener("keydown", down)
     window.addEventListener("keyup", up)
+    window.addEventListener("blur", blur)
     return () => {
       window.removeEventListener("keydown", down)
       window.removeEventListener("keyup", up)
+      window.removeEventListener("blur", blur)
     }
   }, [])
 
@@ -152,17 +187,18 @@ export function Viewport({ className }: { className?: string }) {
     [toDoc, DW, DH, z],
   )
 
-  // wheel: ctrl/cmd = zoom, otherwise pan (trackpads)
   React.useEffect(() => {
     const el = containerRef.current
     if (!el) return
     const onWheel = (e: WheelEvent) => {
       e.preventDefault()
-      if (e.ctrlKey || e.metaKey) {
+      if (e.ctrlKey || e.metaKey || e.altKey) {
         const f = Math.exp(-e.deltaY * (e.deltaMode === 1 ? 0.05 : 0.0022))
         zoomAt(z * f, e.clientX, e.clientY)
       } else {
-        setPan((p) => ({ x: p.x - e.deltaX, y: p.y - e.deltaY }))
+        const dx = e.shiftKey ? e.deltaY : e.deltaX
+        const dy = e.shiftKey ? 0 : e.deltaY
+        setPan((p) => ({ x: p.x - dx, y: p.y - dy }))
         if (!useEditor.getState().zoom) useEditor.getState().setZoom(z)
       }
     }
@@ -170,69 +206,157 @@ export function Viewport({ className }: { className?: string }) {
     return () => el.removeEventListener("wheel", onWheel)
   }, [z, zoomAt])
 
-  const selected = doc.layers.find((l) => l.id === selectedId) ?? null
-  const selBox = selected && !cropMode ? layerBounds(selected) : null
+  const isBase = selectedId === BASE_ID
+  const selected = isBase ? null : (doc.layers.find((l) => l.id === selectedId) ?? null)
+  const showHandles = tool === "move" && !!selected && !cropMode && !editingText && !selected.locked
+  const selBox = showHandles && selected ? layerBounds(selected) : null
 
   const topLayerAt = (p: Pt, filter?: (l: Layer) => boolean) => {
     for (let i = doc.layers.length - 1; i >= 0; i--) {
       const l = doc.layers[i]
       if (!l.visible || l.locked || (filter && !filter(l))) continue
+      if (l.type === "effect" && l.region === "brush") {
+        if (l.strokes.some((s) => s.poly && pointInPoly(p, s.points))) return l
+      }
       const b = layerBounds(l)
-      if (b && hit(b, p, 4 / z)) return l
+      if (b && !(l.type === "effect" && l.invert) && hit(b, p, 4 / z)) return l
     }
     return null
   }
 
   const st = useEditor.getState
 
+  const pickColor = (p: Pt) => {
+    const c = canvasRef.current
+    if (!c) return
+    const x = Math.floor(p.x * renderScale)
+    const y = Math.floor(p.y * renderScale)
+    if (x < 0 || y < 0 || x >= c.width || y >= c.height) return
+    const d = c.getContext("2d")!.getImageData(x, y, 1, 1).data
+    const hex = "#" + [d[0], d[1], d[2]].map((v) => v.toString(16).padStart(2, "0")).join("")
+    st().setColors({ fg: hex })
+  }
+
+  /** starts a paint/erase stroke on the right target */
+  const beginPaint = (p: Pt, e: React.PointerEvent) => {
+    const s = st()
+    const erase = tool === "eraser"
+    const set = erase ? s.eraser : s.brush
+    const stroke: Stroke = { points: [p.x, p.y], size: set.size / z, hardness: set.hardness, alpha: set.opacity }
+    if (e.shiftKey && lastPaintPoint) stroke.points = [lastPaintPoint.x, lastPaintPoint.y, p.x, p.y]
+    const key = `g:${uid()}`
+    if (!erase) {
+      const id = ensurePaintLayer()
+      st().patch((d) => {
+        const L = d.layers.find((x) => x.id === id)
+        if (L?.type === "draw") L.strokes.push({ ...stroke, color: s.fg })
+      }, key)
+      gesture.current = { kind: "paint", target: id, key, last: p, into: "strokes" }
+      return
+    }
+    // eraser
+    if (isBase || (!s.selectedId && doc.baseAssetId)) {
+      if (!doc.baseAssetId) return
+      s.patch((d) => void (d.baseMask = [...(d.baseMask ?? []), stroke]), key)
+      gesture.current = { kind: "paint", target: BASE_ID, key, last: p, into: "base" }
+      return
+    }
+    const l = selected
+    if (!l) return toast.info("Wähle zuerst eine Ebene zum Radieren.")
+    if (l.locked) return toast.info("Diese Ebene ist gesperrt.")
+    if (l.type === "effect") {
+      if (l.region !== "brush") return toast.info("Rahmen-Bereiche mit dem Verschieben-Werkzeug ändern oder löschen.")
+      s.patch((d) => {
+        const L = d.layers.find((x) => x.id === l.id)
+        if (L?.type === "effect") L.strokes.push({ ...stroke, erase: true, hardness: 1, alpha: 1 })
+      }, key)
+      gesture.current = { kind: "paint", target: l.id, key, last: p, into: "strokes" }
+      return
+    }
+    s.patch((d) => {
+      const L = d.layers.find((x) => x.id === l.id)
+      if (L) L.mask = [...(L.mask ?? []), stroke]
+    }, key)
+    gesture.current = { kind: "paint", target: l.id, key, last: p, into: "mask" }
+  }
+
   const onPointerDown = (e: React.PointerEvent) => {
     const el = e.currentTarget as HTMLElement
-    el.setPointerCapture(e.pointerId)
+    if ((e.target as HTMLElement).closest("textarea")) return
+    try {
+      el.setPointerCapture(e.pointerId)
+    } catch {
+      /* synthetic / already released pointers */
+    }
     pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
     if (pointers.current.size === 2) {
       const [a, b] = [...pointers.current.values()]
-      gesture.current = {
-        kind: "pinch",
-        d0: Math.hypot(a.x - b.x, a.y - b.y),
-        z0: z,
-        mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 },
-      }
+      gesture.current = { kind: "pinch", d0: Math.hypot(a.x - b.x, a.y - b.y), z0: z, mid: { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 } }
       return
     }
-    if (e.button === 1 || spaceDown || (e.button === 0 && (e.target as HTMLElement) === containerRef.current && tool !== "privacy" && tool !== "draw")) {
+    if (e.button === 1 || spaceDown || tool === "hand") {
       gesture.current = { kind: "pan", sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y }
       setPanning(true)
       return
     }
     if (e.button !== 0) return
     const p = toDoc(e.clientX, e.clientY)
-    const target = (e.target as HTMLElement).dataset
+    const handle = (e.target as HTMLElement).dataset?.handle ?? (e.target as SVGElement).getAttribute?.("data-handle")
     const s = st()
 
+    // finish inline text editing on any click outside the editor
+    if (s.editingText) {
+      finishTextEdit()
+      if (tool === "text") return
+    }
+
+    if (tool === "zoom") {
+      zoomAt(z * (e.altKey ? 1 / 1.5 : 1.5), e.clientX, e.clientY)
+      return
+    }
+    if (tool === "eyedropper" || (e.altKey && (tool === "brush" || tool === "text" || tool === "shapes"))) {
+      pickColor(p)
+      return
+    }
+
     if (cropMode && crop.rect) {
-      const R = { w: DW, h: DH }
       const orig = { ...crop.rect }
-      if (target.handle) {
-        const [hx, hy] = target.handle.split(",").map(Number)
+      if (handle) {
+        const [hx, hy] = handle.split(",").map(Number)
         gesture.current = { kind: "crop", mode: "resize", hx, hy, start: p, orig }
       } else {
-        const r = { x: orig.x * R.w, y: orig.y * R.h, w: orig.w * R.w, h: orig.h * R.h }
+        const r = { x: orig.x * DW, y: orig.y * DH, w: orig.w * DW, h: orig.h * DH }
         if (p.x >= r.x && p.x <= r.x + r.w && p.y >= r.y && p.y <= r.y + r.h)
           gesture.current = { kind: "crop", mode: "move", hx: 0, hy: 0, start: p, orig }
       }
       return
     }
 
-    // handles on selected layer
-    if (target.handle && selected) {
+    if (tool === "brush" || tool === "eraser") {
+      beginPaint(p, e)
+      return
+    }
+
+    if (tool === "select") {
+      if (selection && !selection.inverted && pointInPoly(p, selectionPolygon(selection)) && !e.shiftKey) {
+        gesture.current = { kind: "moveSelection", start: p, orig: structuredClone(selection) }
+        return
+      }
+      gesture.current = { kind: "select", start: p, points: [p.x, p.y], moved: false }
+      if (selectMode === "lasso") setLasso([p.x, p.y])
+      return
+    }
+
+    // transform handles (move tool only)
+    if (handle && selected && tool === "move") {
       const key = `g:${uid()}`
-      if (target.handle === "rotate") {
+      if (handle === "rotate") {
         const b = layerBounds(selected)!
-        gesture.current = { kind: "rotate", id: selected.id, center: { x: b.x + b.w / 2, y: b.y + b.h / 2 }, orig: selected, key }
-      } else if (target.handle.startsWith("end")) {
-        gesture.current = { kind: "endpoint", id: selected.id, end: target.handle === "end0" ? 0 : 1, orig: selected, key }
+        gesture.current = { kind: "rotate", id: selected.id, center: { x: b.x + b.w / 2, y: b.y + b.h / 2 }, key }
+      } else if (handle.startsWith("end")) {
+        gesture.current = { kind: "endpoint", id: selected.id, end: handle === "end0" ? 0 : 1, orig: selected, key }
       } else {
-        const [hx, hy] = target.handle.split(",").map(Number)
+        const [hx, hy] = handle.split(",").map(Number)
         gesture.current = {
           kind: "resize",
           id: selected.id,
@@ -241,18 +365,16 @@ export function Viewport({ className }: { className?: string }) {
           orig: selected,
           box: layerBounds(selected)!,
           key,
-          keepAspect: selected.type === "image" || selected.type === "text" ? hx !== 0 && hy !== 0 : e.shiftKey,
+          keepAspect: (selected.type === "image" || selected.type === "text") && hx !== 0 && hy !== 0,
         }
       }
       return
     }
 
-    // tool-specific creation
     if (tool === "privacy" && (privacy.region === "brush" || privacy.erase)) {
       const size = privacy.brushSize / z
       const key = `g:${uid()}`
-      let layer =
-        selected?.type === "effect" && selected.region === "brush" ? selected : null
+      let layer = selected?.type === "effect" && selected.region === "brush" ? selected : null
       if (!layer) {
         if (privacy.erase) return
         const l = newEffect(privacy.effect, "brush", 0, 0, 0, 0, Math.min(DW, DH))
@@ -269,73 +391,63 @@ export function Viewport({ className }: { className?: string }) {
           if (L?.type === "effect") L.strokes.push({ points: [p.x, p.y], size, erase: privacy.erase })
         }, key)
       }
-      gesture.current = { kind: "brush", id: layer.id, key, last: p }
-      return
-    }
-    if (tool === "draw") {
-      const size = drawSet.size / z
-      const key = `g:${uid()}`
-      let layer = selected?.type === "draw" ? selected : null
-      if (!layer) {
-        if (drawSet.erase) return
-        const l = newDraw()
-        l.strokes = [{ points: [p.x, p.y], size, color: drawSet.color }]
-        s.patch((d) => void d.layers.push(l), key)
-        s.select(l.id)
-        layer = l
-      } else {
-        const id = layer.id
-        s.patch((d) => {
-          const L = d.layers.find((x) => x.id === id)
-          if (L?.type === "draw") L.strokes.push({ points: [p.x, p.y], size, color: drawSet.color, erase: drawSet.erase })
-        }, key)
-      }
-      gesture.current = { kind: "brush", id: layer.id, key, last: p }
+      gesture.current = { kind: "paint", target: layer.id, key, last: p, into: "strokes" }
       return
     }
 
     const under = topLayerAt(p)
+
     if (tool === "text") {
       if (under?.type === "text") {
         s.select(under.id)
-        gesture.current = { kind: "move", id: under.id, start: p, orig: under, key: `g:${uid()}` }
+        s.setEditingText(under.id)
+        e.preventDefault()
         return
       }
-      // keep the browser from moving focus away from the inline editor we are about to mount
       e.preventDefault()
-      const t = newText(p.x, p.y, Math.round(Math.max(24, Math.min(DW, DH) * 0.08)))
+      const t = { ...newText(p.x, p.y, Math.round(Math.max(24, Math.min(DW, DH) * 0.07))), ...s.textStyle }
+      t.text = ""
+      t.color = s.fg
       t.y -= (t.fontSize * t.lineHeight) / 2
-      s.addLayer(t)
+      const above = s.doc.layers.findIndex((l) => l.id === s.selectedId)
+      s.addLayer(t, true, above < 0 ? undefined : above + 1)
       s.setEditingText(t.id)
       return
     }
-    if ((tool === "privacy" || tool === "shapes") && !(under && under.id === selectedId)) {
-      // clicking an existing effect/shape selects & moves it, otherwise draw a new region
-      const sameKind = under && ((tool === "privacy" && under.type === "effect") || (tool === "shapes" && under.type === "shape"))
-      if (!sameKind) {
-        s.select(null)
+
+    if (tool === "shapes" || tool === "privacy") {
+      const same = under && ((tool === "privacy" && under.type === "effect") || (tool === "shapes" && under.type === "shape"))
+      if (same) {
+        s.select(under.id)
+        gesture.current = { kind: "move", id: under.id, start: p, orig: under, key: `g:${uid()}`, moved: false }
+      } else {
         gesture.current = { kind: "create", id: null, start: p, key: `g:${uid()}`, what: tool === "privacy" ? "effect" : "shape" }
-        return
       }
+      return
     }
-    if (under) {
-      s.select(under.id)
-      if (s.editingText && s.editingText !== under.id) s.setEditingText(null)
-      gesture.current = { kind: "move", id: under.id, start: p, orig: under, key: `g:${uid()}` }
-    } else {
-      s.select(null)
-      s.setEditingText(null)
-      gesture.current = { kind: "pan", sx: e.clientX, sy: e.clientY, px: pan.x, py: pan.y }
-      setPanning(true)
+
+    // move tool
+    // auto-select picks the layer under the cursor; otherwise the active layer moves
+    const pickTarget = s.autoSelect || e.ctrlKey || e.metaKey ? under : selected
+    if (pickTarget) {
+      s.select(pickTarget.id)
+      gesture.current = { kind: "move", id: pickTarget.id, start: p, orig: pickTarget, key: `g:${uid()}`, moved: false }
+    } else if (s.autoSelect) {
+      s.select(doc.baseAssetId ? BASE_ID : null)
     }
   }
 
   const onPointerMove = (e: React.PointerEvent) => {
     if (pointers.current.has(e.pointerId)) pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY })
-    const p = stageRef.current ? toDoc(e.clientX, e.clientY) : null
-    if (p && (tool === "privacy" || tool === "draw")) setCursor(p)
+    if (!stageRef.current) return
+    const p = toDoc(e.clientX, e.clientY)
+    setCursor(p)
+    window.dispatchEvent(new CustomEvent("sheepit:cursor", { detail: p }))
     const g = gesture.current
-    if (!g || !p) return
+    if (!g) {
+      if (tool === "move") setHoverId(topLayerAt(p)?.id ?? null)
+      return
+    }
     const s = st()
     switch (g.kind) {
       case "pan":
@@ -345,13 +457,18 @@ export function Viewport({ className }: { className?: string }) {
       case "pinch": {
         if (pointers.current.size < 2) break
         const [a, b] = [...pointers.current.values()]
-        const d = Math.hypot(a.x - b.x, a.y - b.y)
-        zoomAt(g.z0 * (d / g.d0), g.mid.x, g.mid.y)
+        zoomAt(g.z0 * (Math.hypot(a.x - b.x, a.y - b.y) / g.d0), g.mid.x, g.mid.y)
         break
       }
       case "move": {
-        const dx = p.x - g.start.x
-        const dy = p.y - g.start.y
+        let dx = p.x - g.start.x
+        let dy = p.y - g.start.y
+        if (!g.moved && Math.hypot(dx, dy) * z < 3) break
+        g.moved = true
+        if (e.shiftKey) {
+          if (Math.abs(dx) > Math.abs(dy)) dy = 0
+          else dx = 0
+        }
         s.patch((d) => {
           const i = d.layers.findIndex((l) => l.id === g.id)
           if (i < 0) return
@@ -360,11 +477,13 @@ export function Viewport({ className }: { className?: string }) {
             L.x += dx
             L.y += dy
           }
-          if (L.type === "effect" || L.type === "draw")
-            for (const stx of L.strokes) for (let k = 0; k < stx.points.length; k += 2) {
-              stx.points[k] += dx
-              stx.points[k + 1] += dy
-            }
+          const lists = [L.mask ?? [], L.type === "effect" || L.type === "draw" ? L.strokes : []]
+          for (const list of lists)
+            for (const stx of list)
+              for (let k = 0; k < stx.points.length; k += 2) {
+                stx.points[k] += dx
+                stx.points[k + 1] += dy
+              }
           d.layers[i] = L
         }, g.key)
         break
@@ -372,15 +491,17 @@ export function Viewport({ className }: { className?: string }) {
       case "rotate": {
         let a = Math.atan2(p.y - g.center.y, p.x - g.center.x) / DEG + 90
         if (e.shiftKey) a = Math.round(a / 15) * 15
-        else if (Math.abs(((a % 90) + 90) % 90) < 2.5 || Math.abs(((a % 90) + 90) % 90) > 87.5) a = Math.round(a / 90) * 90
+        else {
+          const m = ((a % 90) + 90) % 90
+          if (m < 2.5 || m > 87.5) a = Math.round(a / 90) * 90
+        }
         s.updateLayer(g.id, { rotation: ((a + 540) % 360) - 180 } as Partial<Layer>, g.key)
         break
       }
       case "endpoint": {
         const o = g.orig
         if (o.type !== "shape") break
-        if (g.end === 0)
-          s.updateLayer(g.id, { x: p.x, y: p.y, width: o.x + o.width - p.x, height: o.y + o.height - p.y }, g.key)
+        if (g.end === 0) s.updateLayer(g.id, { x: p.x, y: p.y, width: o.x + o.width - p.x, height: o.y + o.height - p.y }, g.key)
         else s.updateLayer(g.id, { width: p.x - o.x, height: p.y - o.y }, g.key)
         break
       }
@@ -389,82 +510,119 @@ export function Viewport({ className }: { className?: string }) {
         const a = b.rotation * DEG
         const c0 = { x: b.x + b.w / 2, y: b.y + b.h / 2 }
         const lp = rot({ x: p.x - c0.x, y: p.y - c0.y }, -a)
-        const anchor = { x: (-g.hx * b.w) / 2, y: (-g.hy * b.h) / 2 }
-        let nw = g.hx ? Math.max(4, (lp.x - anchor.x) * g.hx) : b.w
-        let nh = g.hy ? Math.max(4, (lp.y - anchor.y) * g.hy) : b.h
-        if (g.keepAspect || e.shiftKey) {
-          const k = Math.max(nw / b.w, nh / b.h)
+        const fromCenter = e.altKey
+        const anchor = fromCenter ? { x: 0, y: 0 } : { x: (-g.hx * b.w) / 2, y: (-g.hy * b.h) / 2 }
+        const f = fromCenter ? 2 : 1
+        let nw = g.hx ? Math.max(4, (lp.x - anchor.x) * g.hx * f) : b.w
+        let nh = g.hy ? Math.max(4, (lp.y - anchor.y) * g.hy * f) : b.h
+        // Photoshop: proportional by default for images/text, Shift toggles
+        if (g.keepAspect !== e.shiftKey) {
+          const k = g.hx && g.hy ? Math.max(nw / b.w, nh / b.h) : g.hx ? nw / b.w : nh / b.h
           nw = b.w * k
           nh = b.h * k
         }
-        // new centre in local space (edge handles keep the other axis centred)
-        const local = {
-          x: g.hx ? anchor.x + (g.hx * nw) / 2 : 0,
-          y: g.hy ? anchor.y + (g.hy * nh) / 2 : 0,
-        }
+        const local = fromCenter
+          ? { x: 0, y: 0 }
+          : { x: g.hx ? anchor.x + (g.hx * nw) / 2 : 0, y: g.hy ? anchor.y + (g.hy * nh) / 2 : 0 }
         const wc = rot(local, a)
         const C = { x: c0.x + wc.x, y: c0.y + wc.y }
         const o = g.orig
         if (o.type === "text") {
-          const k = nh / b.h
-          const fs = Math.max(4, o.fontSize * k)
+          const fs = Math.max(4, o.fontSize * (nh / b.h))
           const m = measureText({ ...o, fontSize: fs })
-          const cx = m.box.x + m.box.w / 2
-          const cy = m.box.y + m.box.h / 2
-          s.updateLayer(g.id, { fontSize: fs, x: C.x - cx, y: C.y - cy } as Partial<Layer>, g.key)
+          s.updateLayer(g.id, { fontSize: fs, x: C.x - (m.box.x + m.box.w / 2), y: C.y - (m.box.y + m.box.h / 2) } as Partial<Layer>, g.key)
         } else if (o.type === "image" || o.type === "shape" || o.type === "effect") {
           s.updateLayer(g.id, { x: C.x - nw / 2, y: C.y - nh / 2, width: nw, height: nh } as Partial<Layer>, g.key)
         }
         break
       }
       case "create": {
-        const x = Math.min(g.start.x, p.x)
-        const y = Math.min(g.start.y, p.y)
         let w = Math.abs(p.x - g.start.x)
         let h = Math.abs(p.y - g.start.y)
         if (e.shiftKey) w = h = Math.max(w, h)
+        const x = e.altKey ? g.start.x - w : p.x < g.start.x ? g.start.x - w : g.start.x
+        const y = e.altKey ? g.start.y - h : p.y < g.start.y ? g.start.y - h : g.start.y
+        if (e.altKey) {
+          w *= 2
+          h *= 2
+        }
+        const kind = s.shapeKind
+        const line = g.what === "shape" && (kind === "line" || kind === "arrow")
         if (!g.id) {
           if (w * z < 4 && h * z < 4) break
+          let l: Layer
           if (g.what === "effect") {
-            const l = newEffect(privacy.effect, privacy.region === "ellipse" ? "ellipse" : "rect", x, y, w, h, Math.min(DW, DH))
-            g.id = l.id
-            s.patch((d) => void d.layers.push(l), g.key)
-            s.select(l.id)
+            l = newEffect(privacy.effect, privacy.region === "ellipse" ? "ellipse" : "rect", x, y, w, h, Math.min(DW, DH))
           } else {
-            const kind = s.shapeKind
-            const l =
-              kind === "line" || kind === "arrow"
-                ? newShape(kind, g.start.x, g.start.y, p.x - g.start.x, p.y - g.start.y)
-                : newShape(kind, x, y, w, h)
-            l.strokeWidth = Math.max(3, Math.round(Math.min(DW, DH) * 0.008))
-            g.id = l.id
-            s.patch((d) => void d.layers.push(l), g.key)
-            s.select(l.id)
+            const sh = line ? newShape(kind, g.start.x, g.start.y, p.x - g.start.x, p.y - g.start.y) : newShape(kind, x, y, w, h)
+            const style = s.shapeStyle
+            sh.fill = line ? null : style.fill
+            sh.stroke = line ? (style.stroke ?? s.fg) : style.stroke
+            sh.strokeWidth = style.strokeWidth
+            sh.radius = style.radius
+            l = sh
           }
-        } else {
-          const kind = s.shapeKind
-          if (g.what === "shape" && (kind === "line" || kind === "arrow"))
-            s.updateLayer(g.id, { x: g.start.x, y: g.start.y, width: p.x - g.start.x, height: p.y - g.start.y } as Partial<Layer>, g.key)
-          else s.updateLayer(g.id, { x, y, width: w, height: h } as Partial<Layer>, g.key)
-        }
+          g.id = l.id
+          const idx = s.doc.layers.findIndex((x) => x.id === s.selectedId)
+          s.patch((d) => void d.layers.splice(idx < 0 ? d.layers.length : idx + 1, 0, l), g.key)
+          s.select(l.id)
+        } else if (line) {
+          s.updateLayer(g.id, { x: g.start.x, y: g.start.y, width: p.x - g.start.x, height: p.y - g.start.y } as Partial<Layer>, g.key)
+        } else s.updateLayer(g.id, { x, y, width: w, height: h } as Partial<Layer>, g.key)
         break
       }
-      case "brush": {
-        if (Math.hypot(p.x - g.last.x, p.y - g.last.y) < 2 / z) break
-        g.last = p
+      case "paint": {
+        let q = p
+        if (Math.hypot(q.x - g.last.x, q.y - g.last.y) < 1.5 / z) break
+        g.last = q
+        q = { x: q.x, y: q.y }
         s.patch((d) => {
-          const L = d.layers.find((x) => x.id === g.id)
-          if (L && (L.type === "effect" || L.type === "draw")) {
-            const stx = L.strokes[L.strokes.length - 1]
-            stx.points.push(p.x, p.y)
+          let list: Stroke[] | undefined
+          if (g.into === "base") list = d.baseMask
+          else {
+            const L = d.layers.find((x) => x.id === g.target)
+            if (!L) return
+            list = g.into === "mask" ? L.mask : L.type === "draw" || L.type === "effect" ? L.strokes : undefined
           }
+          list?.[list.length - 1]?.points.push(q.x, q.y)
         }, g.key)
         break
       }
+      case "select": {
+        const dx = p.x - g.start.x
+        const dy = p.y - g.start.y
+        if (!g.moved && Math.hypot(dx, dy) * z < 3) break
+        g.moved = true
+        if (selectMode === "lasso") {
+          g.points.push(p.x, p.y)
+          setLasso([...g.points])
+        } else {
+          let w = Math.abs(dx)
+          let h = Math.abs(dy)
+          if (e.shiftKey) w = h = Math.max(w, h)
+          let x = dx < 0 ? g.start.x - w : g.start.x
+          let y = dy < 0 ? g.start.y - h : g.start.y
+          if (e.altKey) {
+            x = g.start.x - w
+            y = g.start.y - h
+            w *= 2
+            h *= 2
+          }
+          s.setSelection({ kind: selectMode, x, y, w, h })
+        }
+        break
+      }
+      case "moveSelection": {
+        const dx = p.x - g.start.x
+        const dy = p.y - g.start.y
+        const o = g.orig
+        if (o.kind === "lasso") s.setSelection({ ...o, points: o.points.map((v, i) => v + (i % 2 ? dy : dx)) })
+        else s.setSelection({ ...o, x: o.x + dx, y: o.y + dy })
+        break
+      }
       case "crop": {
-        const R = { w: DW, h: DH }
-        const dx = (p.x - g.start.x) / R.w
-        const dy = (p.y - g.start.y) / R.h
+        const dx = (p.x - g.start.x) / DW
+        const dy = (p.y - g.start.y) / DH
         const o = g.orig
         let r = { ...o }
         if (g.mode === "move") {
@@ -479,21 +637,16 @@ export function Viewport({ className }: { className?: string }) {
           r = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 }
           const asp = s.crop.aspect
           if (asp) {
-            // aspect in px: (w*R.w)/(h*R.h) = asp
-            const wpx = r.w * R.w
-            const hpx = r.h * R.h
-            if (g.hx !== 0 && (g.hy === 0 || wpx / hpx > asp)) {
-              r.h = wpx / asp / R.h
-            } else {
-              r.w = (hpx * asp) / R.w
-            }
+            const wpx = r.w * DW
+            const hpx = r.h * DH
+            if (g.hx !== 0 && (g.hy === 0 || wpx / hpx > asp)) r.h = wpx / asp / DH
+            else r.w = (hpx * asp) / DW
             if (g.hx < 0) r.x = x1 - r.w
             if (g.hy < 0) r.y = y1 - r.h
             if (g.hy === 0) r.y = o.y + o.h / 2 - r.h / 2
             if (g.hx === 0) r.x = o.x + o.w / 2 - r.w / 2
-            // keep inside
-            if (r.w > 1) { r.h *= 1 / r.w; r.w = 1 }
-            if (r.h > 1) { r.w *= 1 / r.h; r.h = 1 }
+            if (r.w > 1) { r.h /= r.w; r.w = 1 }
+            if (r.h > 1) { r.w /= r.h; r.h = 1 }
             r.x = Math.min(1 - r.w, Math.max(0, r.x))
             r.y = Math.min(1 - r.h, Math.max(0, r.y))
           }
@@ -511,11 +664,18 @@ export function Viewport({ className }: { className?: string }) {
       gesture.current = null
       return
     }
+    if (g?.kind === "paint") lastPaintPoint = g.last
+    if (g?.kind === "select") {
+      if (!g.moved) st().setSelection(null)
+      else if (selectMode === "lasso" && g.points.length >= 6) st().setSelection({ kind: "lasso", points: g.points })
+      setLasso(null)
+    }
     gesture.current = null
     setPanning(false)
   }
 
   const onDoubleClick = (e: React.MouseEvent) => {
+    if (tool !== "move" && tool !== "text") return
     const p = toDoc(e.clientX, e.clientY)
     const under = topLayerAt(p, (l) => l.type === "text")
     if (under) {
@@ -524,23 +684,32 @@ export function Viewport({ className }: { className?: string }) {
     }
   }
 
-  const hs = 9 / z // handle size in doc px
-  const isBrushTool = (tool === "privacy" && (privacy.region === "brush" || privacy.erase)) || tool === "draw"
-  const brushR = ((tool === "draw" ? drawSet.size : privacy.brushSize) / z) / 2
+  const hs = 9 / z
+  const isBrushTool = tool === "brush" || tool === "eraser" || (tool === "privacy" && (privacy.region === "brush" || privacy.erase))
+  const brushPx = tool === "brush" ? brush.size : tool === "eraser" ? eraser.size : privacy.brushSize
+  const brushR = brushPx / z / 2
   const cursorClass = panning
     ? "cursor-grabbing"
-    : spaceDown
+    : spaceDown || tool === "hand"
       ? "cursor-grab"
-      : isBrushTool
-        ? "cursor-none"
-        : tool === "text"
-          ? "cursor-text"
-          : tool === "privacy" || tool === "shapes"
-            ? "cursor-crosshair"
-            : "cursor-default"
+      : tool === "zoom"
+        ? altDown
+          ? "cursor-zoom-out"
+          : "cursor-zoom-in"
+        : tool === "eyedropper" || (altDown && (tool === "brush" || tool === "text" || tool === "shapes"))
+          ? "cursor-copy"
+          : isBrushTool
+            ? "cursor-none"
+            : tool === "text"
+              ? "cursor-text"
+              : tool === "select" || tool === "privacy" || tool === "shapes" || tool === "crop"
+                ? "cursor-crosshair"
+                : "cursor-default"
 
   const editLayer = doc.layers.find((l) => l.id === editingText && l.type === "text") as TextLayer | undefined
-  const R = cropMode ? rotatedSize(doc) : null
+  const hover = tool === "move" && hoverId && hoverId !== selectedId ? doc.layers.find((l) => l.id === hoverId) : null
+  const hoverBox = hover ? layerBounds(hover) : null
+  const selPoly = selection ? selectionPolygon(selection) : null
 
   return (
     <div
@@ -550,8 +719,12 @@ export function Viewport({ className }: { className?: string }) {
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onPointerCancel={onPointerUp}
-      onPointerLeave={() => setCursor(null)}
+      onPointerLeave={() => {
+        setCursor(null)
+        setHoverId(null)
+      }}
       onDoubleClick={onDoubleClick}
+      onContextMenu={(e) => e.preventDefault()}
       data-viewport
     >
       <div
@@ -561,6 +734,8 @@ export function Viewport({ className }: { className?: string }) {
           width: DW,
           height: DH,
           transform: `translate(-50%, -50%) translate(${pan.x}px, ${pan.y}px) scale(${z})`,
+          // hidden until the viewport has been measured (avoids a 100 % flash)
+          visibility: box.w ? "visible" : "hidden",
         }}
       >
         <div className="checkerboard absolute inset-0 shadow-[0_30px_80px_-20px_rgba(0,0,0,.7)]" />
@@ -569,18 +744,15 @@ export function Viewport({ className }: { className?: string }) {
           className="absolute inset-0 size-full"
           style={{ imageRendering: z * renderScale > 2 ? "pixelated" : "auto" }}
         />
-        <svg
-          className="absolute inset-0 size-full overflow-visible"
-          viewBox={`0 0 ${DW} ${DH}`}
-          style={{ pointerEvents: "none" }}
-        >
-          {/* hover outlines for effect layers in privacy tool */}
+        <svg className="absolute inset-0 size-full overflow-visible" viewBox={`0 0 ${DW} ${DH}`} style={{ pointerEvents: "none" }}>
+          {/* privacy regions: thin outlines only (no transform box) */}
           {tool === "privacy" &&
             !cropMode &&
             doc.layers
-              .filter((l) => l.type === "effect" && l.visible && l.id !== selectedId && l.region !== "brush")
+              .filter((l) => l.type === "effect" && l.visible && l.region !== "brush")
               .map((l) => {
                 const b = layerBounds(l)!
+                const active = l.id === selectedId
                 return (
                   <rect
                     key={l.id}
@@ -588,27 +760,36 @@ export function Viewport({ className }: { className?: string }) {
                     y={b.y}
                     width={Math.abs(b.w)}
                     height={Math.abs(b.h)}
+                    rx={l.type === "effect" && l.region === "ellipse" ? Math.abs(b.w) / 2 : 0}
                     fill="none"
-                    stroke="white"
-                    strokeOpacity={0.35}
+                    stroke={active ? "var(--lime)" : "white"}
+                    strokeOpacity={active ? 0.9 : 0.35}
                     strokeDasharray={`${4 / z} ${4 / z}`}
-                    strokeWidth={1 / z}
+                    strokeWidth={1.2 / z}
                   />
                 )
               })}
 
-          {selBox && selected && !editingText && (
-            <SelectionHandles layer={selected} b={selBox} hs={hs} z={z} />
+          {hoverBox && (
+            <g transform={`rotate(${hoverBox.rotation} ${hoverBox.x + hoverBox.w / 2} ${hoverBox.y + hoverBox.h / 2})`}>
+              <rect x={hoverBox.x} y={hoverBox.y} width={Math.abs(hoverBox.w)} height={Math.abs(hoverBox.h)} fill="none" stroke="#3b9dff" strokeWidth={1.5 / z} />
+            </g>
           )}
 
-          {cropMode && crop.rect && R && (
-            <CropOverlay rect={crop.rect} W={DW} H={DH} hs={hs} z={z} />
-          )}
+          {selBox && selected && <SelectionHandles layer={selected} b={selBox} hs={hs} z={z} />}
 
-          {isBrushTool && cursor && (
+          {cropMode && crop.rect && <CropOverlay rect={crop.rect} W={DW} H={DH} hs={hs} z={z} />}
+
+          {selPoly && !cropMode && <MarchingAnts points={selPoly} z={z} inverted={!!selection?.inverted} W={DW} H={DH} />}
+          {lasso && lasso.length >= 4 && <MarchingAnts points={lasso} z={z} open />}
+
+          {isBrushTool && cursor && !panning && (
             <g>
               <circle cx={cursor.x} cy={cursor.y} r={brushR} fill="none" stroke="black" strokeOpacity={0.6} strokeWidth={3 / z} />
               <circle cx={cursor.x} cy={cursor.y} r={brushR} fill="none" stroke="white" strokeWidth={1.25 / z} />
+              {tool === "brush" && brush.hardness < 0.95 && (
+                <circle cx={cursor.x} cy={cursor.y} r={brushR * (0.35 + 0.65 * brush.hardness)} fill="none" stroke="white" strokeOpacity={0.5} strokeDasharray={`${2 / z} ${2 / z}`} strokeWidth={1 / z} />
+              )}
             </g>
           )}
         </svg>
@@ -616,6 +797,22 @@ export function Viewport({ className }: { className?: string }) {
         {editLayer && <InlineTextEditor layer={editLayer} />}
       </div>
     </div>
+  )
+}
+
+function MarchingAnts({ points, z, open, inverted, W, H }: { points: number[]; z: number; open?: boolean; inverted?: boolean; W?: number; H?: number }) {
+  let d = `M${points[0]} ${points[1]}`
+  for (let i = 2; i < points.length; i += 2) d += `L${points[i]} ${points[i + 1]}`
+  if (!open) d += "Z"
+  const dash = `${5 / z} ${5 / z}`
+  return (
+    <g>
+      {inverted && W && H && (
+        <rect x={0} y={0} width={W} height={H} fill="none" stroke="white" strokeWidth={1 / z} strokeDasharray={dash} className="sheepit-ants" />
+      )}
+      <path d={d} fill="none" stroke="black" strokeWidth={1.2 / z} />
+      <path d={d} fill="none" stroke="white" strokeWidth={1.2 / z} strokeDasharray={dash} className="sheepit-ants" style={{ ["--ants" as string]: `${10 / z}px` }} />
+    </g>
   )
 }
 
@@ -630,18 +827,16 @@ function SelectionHandles({ layer, b, hs, z }: { layer: Layer; b: Box; hs: numbe
     ]
     return (
       <g>
-        <line x1={pts[0].x} y1={pts[0].y} x2={pts[1].x} y2={pts[1].y} stroke="var(--lime)" strokeWidth={sw} strokeDasharray={`${4 / z}`} />
+        <line x1={pts[0].x} y1={pts[0].y} x2={pts[1].x} y2={pts[1].y} stroke="#3b9dff" strokeWidth={sw} />
         {pts.map((p) => (
-          <circle key={p.h} data-handle={p.h} cx={p.x} cy={p.y} r={hs * 0.7} fill="white" stroke="var(--lime)" strokeWidth={sw} style={{ pointerEvents: "all", cursor: "move" }} />
+          <circle key={p.h} data-handle={p.h} cx={p.x} cy={p.y} r={hs * 0.6} fill="white" stroke="#3b9dff" strokeWidth={sw} style={{ pointerEvents: "all", cursor: "move" }} />
         ))}
       </g>
     )
   }
   const resizable = layer.type === "image" || layer.type === "shape" || layer.type === "text" || (layer.type === "effect" && layer.region !== "brush")
   const rotatable = layer.type === "image" || layer.type === "shape" || layer.type === "text"
-  const handles: [number, number][] = layer.type === "text"
-    ? [[-1, -1], [1, -1], [1, 1], [-1, 1]]
-    : [[-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0]]
+  const handles: [number, number][] = [[-1, -1], [0, -1], [1, -1], [1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0]]
   const cursors: Record<string, string> = {
     "-1,-1": "nwse-resize", "1,1": "nwse-resize", "1,-1": "nesw-resize", "-1,1": "nesw-resize",
     "0,-1": "ns-resize", "0,1": "ns-resize", "-1,0": "ew-resize", "1,0": "ew-resize",
@@ -650,21 +845,11 @@ function SelectionHandles({ layer, b, hs, z }: { layer: Layer; b: Box; hs: numbe
   const h = Math.abs(b.h)
   return (
     <g transform={`rotate(${b.rotation} ${cx} ${cy})`}>
-      <rect x={cx - w / 2} y={cy - h / 2} width={w} height={h} fill="none" stroke="black" strokeOpacity={0.5} strokeWidth={sw * 2.2} />
-      <rect x={cx - w / 2} y={cy - h / 2} width={w} height={h} fill="none" stroke="var(--lime)" strokeWidth={sw} />
+      <rect x={cx - w / 2} y={cy - h / 2} width={w} height={h} fill="none" stroke="#3b9dff" strokeWidth={sw} />
       {rotatable && (
         <>
-          <line x1={cx} y1={cy - h / 2} x2={cx} y2={cy - h / 2 - 26 / z} stroke="var(--lime)" strokeWidth={sw} />
-          <circle
-            data-handle="rotate"
-            cx={cx}
-            cy={cy - h / 2 - 26 / z}
-            r={hs * 0.7}
-            fill="var(--lime)"
-            stroke="black"
-            strokeWidth={sw * 0.6}
-            style={{ pointerEvents: "all", cursor: "grab" }}
-          />
+          <line x1={cx} y1={cy - h / 2} x2={cx} y2={cy - h / 2 - 24 / z} stroke="#3b9dff" strokeWidth={sw} />
+          <circle data-handle="rotate" cx={cx} cy={cy - h / 2 - 24 / z} r={hs * 0.6} fill="white" stroke="#3b9dff" strokeWidth={sw} style={{ pointerEvents: "all", cursor: "grab" }} />
         </>
       )}
       {resizable &&
@@ -676,11 +861,9 @@ function SelectionHandles({ layer, b, hs, z }: { layer: Layer; b: Box; hs: numbe
             y={cy + (hy * h) / 2 - hs / 2}
             width={hs}
             height={hs}
-            rx={hs * 0.25}
             fill="white"
-            stroke="black"
-            strokeOpacity={0.6}
-            strokeWidth={sw * 0.8}
+            stroke="#3b9dff"
+            strokeWidth={sw}
             style={{ pointerEvents: "all", cursor: cursors[`${hx},${hy}`] }}
           />
         ))}
@@ -700,11 +883,7 @@ function CropOverlay({ rect, W, H, hs, z }: { rect: { x: number; y: number; w: n
   const pos = (hx: number, hy: number) => ({ x: x + ((hx + 1) / 2) * w, y: y + ((hy + 1) / 2) * h })
   return (
     <g>
-      <path
-        d={`M0 0H${W}V${H}H0Z M${x} ${y}V${y + h}H${x + w}V${y}Z`}
-        fill="rgba(8,8,10,.62)"
-        fillRule="evenodd"
-      />
+      <path d={`M0 0H${W}V${H}H0Z M${x} ${y}V${y + h}H${x + w}V${y}Z`} fill="rgba(8,8,10,.62)" fillRule="evenodd" />
       <rect x={x} y={y} width={w} height={h} fill="none" stroke="white" strokeWidth={sw} style={{ pointerEvents: "all", cursor: "move" }} />
       {[1, 2].map((i) => (
         <g key={i} stroke="white" strokeOpacity={0.45} strokeWidth={sw * 0.7}>
@@ -716,21 +895,8 @@ function CropOverlay({ rect, W, H, hs, z }: { rect: { x: number; y: number; w: n
         const p = pos(hx, hy)
         return (
           <g key={`${hx}${hy}`}>
-            <path
-              d={`M${p.x} ${p.y - hy * L}V${p.y}H${p.x - hx * L}`}
-              fill="none"
-              stroke="white"
-              strokeWidth={4 / z}
-            />
-            <rect
-              data-handle={`${hx},${hy}`}
-              x={p.x - hs * 1.2}
-              y={p.y - hs * 1.2}
-              width={hs * 2.4}
-              height={hs * 2.4}
-              fill="transparent"
-              style={{ pointerEvents: "all", cursor: hx === hy ? "nwse-resize" : "nesw-resize" }}
-            />
+            <path d={`M${p.x} ${p.y - hy * L}V${p.y}H${p.x - hx * L}`} fill="none" stroke="white" strokeWidth={4 / z} />
+            <rect data-handle={`${hx},${hy}`} x={p.x - hs * 1.2} y={p.y - hs * 1.2} width={hs * 2.4} height={hs * 2.4} fill="transparent" style={{ pointerEvents: "all", cursor: hx === hy ? "nwse-resize" : "nesw-resize" }} />
           </g>
         )
       })}
@@ -755,40 +921,45 @@ function CropOverlay({ rect, W, H, hs, z }: { rect: { x: number; y: number; w: n
   )
 }
 
+/** On-canvas text editing – type directly into the image (Photoshop style). */
 function InlineTextEditor({ layer }: { layer: TextLayer }) {
   const ref = React.useRef<HTMLTextAreaElement>(null)
-  const m = measureText(layer)
+  const m = measureText({ ...layer, text: layer.text || " " })
   React.useEffect(() => {
     const t = ref.current
     if (!t) return
-    // focus after the pointer sequence that created the layer has finished
     const id = requestAnimationFrame(() => {
       t.focus()
-      t.select()
+      t.setSelectionRange(t.value.length, t.value.length)
     })
     return () => cancelAnimationFrame(id)
   }, [layer.id])
-  const finish = () => useEditor.getState().setEditingText(null)
-  const minW = Math.max(m.w, layer.fontSize * 2)
-  const left = layer.align === "left" ? layer.x : layer.align === "center" ? layer.x - minW / 2 : layer.x - minW
+  const width = Math.max(m.w, layer.fontSize * 0.6) + layer.fontSize * 0.6
+  const left = layer.align === "left" ? layer.x : layer.align === "center" ? layer.x - width / 2 : layer.x - width
+  const cx = m.box.x + m.box.w / 2
+  const cy = m.box.y + m.box.h / 2
   return (
     <textarea
       ref={ref}
       value={layer.text}
       spellCheck={false}
+      placeholder="Text eingeben"
       onPointerDown={(e) => e.stopPropagation()}
       onChange={(e) => useEditor.getState().updateLayer(layer.id, { text: e.target.value }, `text:${layer.id}`)}
-      onBlur={finish}
+      onBlur={() => finishTextEdit()}
       onKeyDown={(e) => {
         e.stopPropagation()
-        if (e.key === "Escape" || (e.key === "Enter" && (e.metaKey || e.ctrlKey))) finish()
+        if (e.key === "Escape" || (e.key === "Enter" && (e.metaKey || e.ctrlKey))) {
+          e.preventDefault()
+          finishTextEdit()
+        }
       }}
-      className="absolute resize-none overflow-hidden border-0 bg-transparent p-0 outline-2 outline-offset-4 outline-[var(--lime)] outline-dashed"
+      className="absolute resize-none overflow-hidden border-0 bg-transparent p-0 whitespace-pre outline-1 outline-offset-2 outline-[#3b9dff] placeholder:text-white/40"
       style={{
         left,
         top: layer.y,
-        width: minW + layer.fontSize,
-        height: m.h + 4,
+        width,
+        height: m.h + 2,
         font: textFont(layer),
         fontFamily: fontFamilyFor(layer.fontFamily),
         lineHeight: `${layer.fontSize * layer.lineHeight}px`,
@@ -796,8 +967,10 @@ function InlineTextEditor({ layer }: { layer: TextLayer }) {
         textAlign: layer.align,
         color: layer.color,
         textTransform: layer.uppercase ? "uppercase" : "none",
+        transformOrigin: `${layer.x - left + cx}px ${cy}px`,
         transform: `rotate(${layer.rotation}deg)`,
-        caretColor: "var(--lime)",
+        caretColor: layer.color,
+        opacity: layer.opacity,
         textShadow: layer.shadow ? "0 2px 12px rgba(0,0,0,.45)" : undefined,
         WebkitTextStroke: layer.strokeColor && layer.strokeWidth ? `${layer.strokeWidth}px ${layer.strokeColor}` : undefined,
         background: layer.background ?? "transparent",

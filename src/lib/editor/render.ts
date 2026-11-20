@@ -1,9 +1,9 @@
-import { applyEffect, ctx2d, drawStroke, makeCanvas } from "./effects"
+import { applyEffect, applyMask, ctx2d, drawStroke, makeCanvas } from "./effects"
 import { fontFamilyFor } from "./fonts"
 import { DevelopRenderer } from "./gl/develop"
 import { effectiveAdjustments } from "./looks"
 import { isAdjustmentsDefault } from "./defaults"
-import type { Asset, Geometry, ImageLayer, Layer, SheepDoc, ShapeLayer, TextLayer } from "./types"
+import type { Asset, Geometry, ImageLayer, Layer, SheepDoc, ShapeLayer, Stroke, TextLayer } from "./types"
 
 const DEG = Math.PI / 180
 
@@ -66,6 +66,8 @@ export interface RenderOptions {
   background?: string | null
   /** reuse the developed base image when only layers changed (interactive preview) */
   cacheBase?: boolean
+  /** do not draw the background photo / colour */
+  skipBase?: boolean
 }
 
 let baseKey = ""
@@ -123,17 +125,26 @@ export function renderDoc(
   ctx.globalAlpha = 1
   ctx.globalCompositeOperation = "source-over"
   ctx.clearRect(0, 0, W, H)
-  const bg = opts.background !== undefined ? opts.background : doc.baseAssetId ? null : doc.background
-  if (bg) {
+  const bg = opts.skipBase
+    ? null
+    : opts.background !== undefined
+      ? opts.background
+      : doc.baseAssetId || doc.background === "transparent"
+        ? null
+        : doc.background
+  if (bg && bg !== "transparent") {
     ctx.fillStyle = bg
     ctx.fillRect(0, 0, W, H)
   }
 
-  const base = doc.baseAssetId ? assets.get(doc.baseAssetId) : undefined
+  const base = doc.baseAssetId && !opts.skipBase && !doc.baseHidden ? assets.get(doc.baseAssetId) : undefined
+  // with an erase mask the background is composited through its own buffer
+  const baseTarget = base && doc.baseMask?.length ? makeCanvas(W, H) : canvas
+  const bctx = baseTarget === canvas ? ctx : ctx2d(baseTarget)
   if (base) {
     const key = `${base.id}|${W}x${H}|${scale}|${opts.original ? 1 : 0}|${JSON.stringify(doc.geometry)}|${JSON.stringify(doc.adjustments)}|${doc.look}|${doc.lookAmount}`
     if (opts.cacheBase && key === baseKey && baseCache) {
-      ctx.drawImage(baseCache, 0, 0)
+      bctx.drawImage(baseCache, 0, 0)
     } else {
       const { canvas: geo, changed } = geometryCanvas(doc, base, W, H, scale)
       const adj = effectiveAdjustments(doc.adjustments, doc.look, doc.lookAmount)
@@ -144,7 +155,7 @@ export function renderDoc(
         lastDevelopSrc = geo
         src = dev.render(adj, scale)
       }
-      ctx.drawImage(src, 0, 0)
+      bctx.drawImage(src, 0, 0)
       if (opts.cacheBase) {
         if (!baseCache || baseCache.width !== W || baseCache.height !== H) baseCache = makeCanvas(W, H)
         const bc = ctx2d(baseCache)
@@ -153,6 +164,10 @@ export function renderDoc(
         baseKey = key
       }
     }
+  }
+  if (base && baseTarget !== canvas) {
+    applyMask(bctx, doc.baseMask, scale)
+    ctx.drawImage(baseTarget, 0, 0)
   }
 
   for (const layer of doc.layers) {
@@ -180,34 +195,52 @@ function drawLayer(
     applyEffect(canvas, layer, s)
     return
   }
+  // layers with an erase mask (and paint layers) are rendered in isolation first,
+  // so erasing never punches through to the layers below
+  if (layer.mask?.length || layer.type === "draw") {
+    const buf = makeCanvas(canvas.width, canvas.height)
+    const b = ctx2d(buf)
+    paintLayer(b, layer, assets, s)
+    applyMask(b, layer.mask, s)
+    ctx.save()
+    ctx.setTransform(1, 0, 0, 1, 0, 0)
+    ctx.globalAlpha = layer.opacity
+    ctx.globalCompositeOperation = layer.blend
+    ctx.drawImage(buf, 0, 0)
+    ctx.restore()
+    return
+  }
   ctx.save()
   ctx.globalAlpha = layer.opacity
   ctx.globalCompositeOperation = layer.blend
-  ctx.scale(s, s)
+  paintLayer(ctx, layer, assets, s)
+  ctx.restore()
+}
+
+/** Paints a layer's own content (no opacity/blend) – ctx at identity transform. */
+function paintLayer(ctx: CanvasRenderingContext2D, layer: Layer, assets: Map<string, Asset>, s: number) {
+  ctx.save()
   switch (layer.type) {
     case "image":
+      ctx.scale(s, s)
       drawImageLayer(ctx, layer, assets)
       break
     case "text":
+      ctx.scale(s, s)
       drawText(ctx, layer)
       break
     case "shape":
+      ctx.scale(s, s)
       drawShape(ctx, layer)
       break
-    case "draw": {
-      // own buffer so the eraser only affects this layer
-      const buf = makeCanvas(canvas.width, canvas.height)
-      const b = ctx2d(buf)
+    case "draw":
       for (const st of layer.strokes) {
-        b.strokeStyle = st.color
-        b.fillStyle = st.color
-        b.globalCompositeOperation = st.erase ? "destination-out" : "source-over"
-        drawStroke(b, st, s)
+        ctx.strokeStyle = st.color
+        ctx.fillStyle = st.color
+        ctx.globalCompositeOperation = st.erase ? "destination-out" : "source-over"
+        drawStroke(ctx, st, s)
       }
-      ctx.setTransform(1, 0, 0, 1, 0, 0)
-      ctx.drawImage(buf, 0, 0)
       break
-    }
   }
   ctx.restore()
 }
@@ -367,4 +400,71 @@ export function layerBounds(l: Layer): { x: number; y: number; w: number; h: num
       return isFinite(x0) ? { x: x0, y: y0, w: x1 - x0, h: y1 - y0, rotation: 0 } : null
     }
   }
+}
+
+/**
+ * Keeps a layer's erase mask glued to the layer when it is moved, scaled or
+ * rotated: every mask point is mapped from the old box into the new box.
+ */
+export function remapMask<T extends Layer>(before: Layer, after: T): T {
+  if (!after.mask?.length || after.type === "draw") return after
+  const a = layerBounds(before)
+  const b = layerBounds(after)
+  if (!a || !b || !a.w || !a.h) return after
+  if (a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h && a.rotation === b.rotation) return after
+  const ca = { x: a.x + a.w / 2, y: a.y + a.h / 2 }
+  const cb = { x: b.x + b.w / 2, y: b.y + b.h / 2 }
+  const ra = -a.rotation * DEG
+  const rb = b.rotation * DEG
+  const sx = b.w / a.w
+  const sy = b.h / a.h
+  const k = Math.sqrt(Math.abs(sx * sy))
+  return {
+    ...after,
+    mask: after.mask.map((m) => {
+      const pts = m.points.slice()
+      for (let i = 0; i < pts.length; i += 2) {
+        const dx = pts[i] - ca.x
+        const dy = pts[i + 1] - ca.y
+        const lx = (dx * Math.cos(ra) - dy * Math.sin(ra)) * sx
+        const ly = (dx * Math.sin(ra) + dy * Math.cos(ra)) * sy
+        pts[i] = cb.x + lx * Math.cos(rb) - ly * Math.sin(rb)
+        pts[i + 1] = cb.y + lx * Math.sin(rb) + ly * Math.cos(rb)
+      }
+      return { ...m, points: pts, size: m.size * k }
+    }),
+  }
+}
+
+/** Matrix mapping centred source-image coordinates to document coordinates (same as drawGeometry). */
+export function geometryMatrix(doc: Pick<SheepDoc, "sourceWidth" | "sourceHeight" | "geometry">): DOMMatrix {
+  const g = doc.geometry
+  const odd = g.rotate90 % 2 === 1
+  const RW = odd ? doc.sourceHeight : doc.sourceWidth
+  const RH = odd ? doc.sourceWidth : doc.sourceHeight
+  const k = coverScale(RW, RH, g.straighten)
+  return new DOMMatrix()
+    .translate(-g.crop.x * RW, -g.crop.y * RH)
+    .translate(RW / 2, RH / 2)
+    .rotate(g.straighten)
+    .scale(k, k)
+    .rotate(g.rotate90 * 90)
+    .scale(g.flipH ? -1 : 1, g.flipV ? -1 : 1)
+}
+
+/** Keeps background erase masks glued to the photo when crop/rotate/flip/straighten change. */
+export function remapBaseMask(prev: SheepDoc, next: SheepDoc, mask = next.baseMask): Stroke[] | undefined {
+  if (!mask?.length || !prev.baseAssetId || prev.baseAssetId !== next.baseAssetId) return mask
+  if (JSON.stringify(prev.geometry) === JSON.stringify(next.geometry)) return mask
+  const M = geometryMatrix(next).multiply(geometryMatrix(prev).inverse())
+  const ks = Math.sqrt(Math.abs(M.a * M.d - M.b * M.c))
+  return mask.map((m) => {
+    const pts = m.points.slice()
+    for (let i = 0; i < pts.length; i += 2) {
+      const p = M.transformPoint({ x: pts[i], y: pts[i + 1] })
+      pts[i] = p.x
+      pts[i + 1] = p.y
+    }
+    return { ...m, points: pts, size: m.size * ks }
+  })
 }

@@ -16,12 +16,13 @@ export function shiftLayer(l: Layer, dx: number, dy: number) {
     l.x += dx
     l.y += dy
   }
-  if (l.type === "effect" || l.type === "draw") {
-    for (const s of l.strokes) for (let i = 0; i < s.points.length; i += 2) {
-      s.points[i] += dx
-      s.points[i + 1] += dy
-    }
-  }
+  const lists = [l.mask ?? [], l.type === "effect" || l.type === "draw" ? l.strokes : []]
+  for (const list of lists)
+    for (const s of list)
+      for (let i = 0; i < s.points.length; i += 2) {
+        s.points[i] += dx
+        s.points[i + 1] += dy
+      }
 }
 
 /** Commits the crop draft, keeping layers anchored to the image. */
@@ -43,7 +44,19 @@ export function applyCrop() {
 export function switchTool(t: ToolId) {
   const s = get()
   if (s.tool === "crop" && t !== "crop") applyCrop()
+  // finishing an empty text edit removes the empty layer
+  if (s.editingText) finishTextEdit()
   s.setTool(t)
+}
+
+/** Ends inline text editing; empty text layers are removed (like Photoshop). */
+export function finishTextEdit() {
+  const s = get()
+  const id = s.editingText
+  if (!id) return
+  s.setEditingText(null)
+  const l = s.doc.layers.find((x) => x.id === id)
+  if (l?.type === "text" && !l.text.trim()) s.removeLayer(id)
 }
 
 /** Geometry changes that alter the rotated frame reset the crop. */
@@ -123,7 +136,7 @@ export async function addImageLayer(blob: Blob, name = "Bild") {
     rotation: 0,
     flipH: false,
   })
-  s.setTool("move")
+  switchTool("move")
 }
 
 export async function autoDetectFaces(doc?: SheepDoc) {

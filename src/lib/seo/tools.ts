@@ -1,7 +1,7 @@
 import type { ToolId } from "@/lib/editor/types"
 
 export interface EditorPreset {
-  tool: ToolId
+  tool: ToolId | "adjust" | "looks"
   privacy?: { effect?: "blur" | "pixelate" | "redact" | "noise" | "glass"; region?: "rect" | "ellipse" | "brush"; invert?: boolean }
   autoFaces?: boolean
   invertBlur?: boolean

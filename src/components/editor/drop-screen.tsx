@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { FileArchive, ImagePlus, ShieldCheck, Smartphone, Monitor, Square, MonitorPlay as Youtube, FileText } from "lucide-react"
-import { useEditor } from "@/lib/editor/store"
+import { newDocument } from "@/lib/editor/ops"
 import { openFile } from "@/lib/editor/actions"
 import { ACCEPT } from "@/lib/editor/handoff"
 import { BorderBeam } from "@/components/ui/border-beam"
@@ -17,10 +17,9 @@ const BLANKS = [
   { label: "A4 Hochformat", w: 2480, h: 3508, icon: FileText },
 ]
 
-export function DropScreen({ hint }: { hint?: string }) {
+export function DropScreen({ hint, onNew }: { hint?: string; onNew?: () => void }) {
   const [over, setOver] = React.useState(false)
   const input = React.useRef<HTMLInputElement>(null)
-  const newBlank = useEditor((s) => s.newBlank)
 
   return (
     <div className="flex h-full w-full items-center justify-center overflow-y-auto p-4 md:p-10">
@@ -77,13 +76,18 @@ export function DropScreen({ hint }: { hint?: string }) {
         <div className="grid gap-2">
           <p className="text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
             Oder mit leerer Leinwand starten
+            {onNew && (
+              <button type="button" onClick={onNew} className="ml-2 normal-case tracking-normal text-primary hover:underline">
+                Eigene Größe …
+              </button>
+            )}
           </p>
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-5">
             {BLANKS.map(({ label, w, h, icon: Icon }) => (
               <button
                 key={label}
                 type="button"
-                onClick={() => newBlank(w, h, "#f6f1e4")}
+                onClick={() => newDocument(w, h, "#ffffff", label)}
                 className="group grid gap-1.5 rounded-2xl bg-card/70 p-3 text-left ring-1 ring-white/5 transition hover:bg-card hover:ring-white/15"
               >
                 <Icon className="size-4 text-muted-foreground group-hover:text-primary" />

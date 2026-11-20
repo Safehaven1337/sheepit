@@ -110,6 +110,14 @@ export interface Stroke {
   size: number
   /** true = erase from mask */
   erase?: boolean
+  /** 0..1, 1 = hard edge */
+  hardness?: number
+  /** 0..1 stroke opacity */
+  alpha?: number
+  /** points describe a closed polygon that gets filled (selection fill / delete) */
+  poly?: boolean
+  /** with poly: fill everything except the polygon (inverted selection) */
+  invert?: boolean
 }
 
 interface LayerBase {
@@ -119,6 +127,8 @@ interface LayerBase {
   locked: boolean
   opacity: number // 0..1
   blend: BlendMode
+  /** erase operations (eraser tool, "delete selection") applied to this layer only */
+  mask?: Stroke[]
 }
 
 export interface ImageLayer extends LayerBase {
@@ -214,7 +224,11 @@ export interface SheepDoc {
   look: string | null
   lookAmount: number // 0..1
   layers: Layer[]
-  background: string // used when there is no base image / for transparency on jpg export
+  background: string // used when there is no base image; "transparent" = none
+  /** background (photo) layer visibility */
+  baseHidden?: boolean
+  /** erase operations on the background photo */
+  baseMask?: Stroke[]
 }
 
 export interface Asset {
@@ -228,11 +242,20 @@ export interface Asset {
 
 export type ToolId =
   | "move"
+  | "select"
   | "crop"
-  | "adjust"
-  | "looks"
-  | "privacy"
+  | "eyedropper"
+  | "brush"
+  | "eraser"
   | "text"
   | "shapes"
-  | "draw"
-  | "resize"
+  | "privacy"
+  | "hand"
+  | "zoom"
+
+/** id used for the background photo in layer selection */
+export const BASE_ID = "__base__"
+
+export type SelectionShape =
+  | { kind: "rect" | "ellipse"; x: number; y: number; w: number; h: number; inverted?: boolean }
+  | { kind: "lasso"; points: number[]; inverted?: boolean }
