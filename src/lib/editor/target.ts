@@ -5,7 +5,7 @@
 // adjustments applied to the active layer).
 import { defaultAdjustments } from "./defaults"
 import { useEditor } from "./store"
-import { BASE_ID, type Adjustments, type Layer, type SheepDoc } from "./types"
+import { BASE_ID, type Adjustments, type Filters, type Layer, type SheepDoc } from "./types"
 
 export type AdjTarget = { kind: "base" } | { kind: "layer"; id: string; name: string }
 
@@ -13,6 +13,7 @@ export interface DevelopState {
   adjustments: Adjustments
   look: string | null
   lookAmount: number
+  filters: Filters
 }
 
 export const isAdjustable = (l: Layer | undefined | null) => !!l && l.type !== "effect"
@@ -33,14 +34,17 @@ export function useAdjTarget() {
 }
 
 export function readDevelop(doc: SheepDoc, t: AdjTarget): DevelopState {
-  if (t.kind === "base") return { adjustments: doc.adjustments, look: doc.look, lookAmount: doc.lookAmount }
+  if (t.kind === "base") return { adjustments: doc.adjustments, look: doc.look, lookAmount: doc.lookAmount, filters: doc.filters ?? NO_FILTERS }
   const l = doc.layers.find((x) => x.id === t.id)
   return {
     adjustments: l?.adjustments ?? DEFAULT,
     look: l?.look ?? null,
     lookAmount: l?.lookAmount ?? 1,
+    filters: l?.filters ?? NO_FILTERS,
   }
 }
+
+const NO_FILTERS: Filters = {}
 
 const DEFAULT = defaultAdjustments()
 
@@ -48,11 +52,12 @@ const DEFAULT = defaultAdjustments()
 export function patchDevelop(t: AdjTarget, recipe: (d: DevelopState) => void, key?: string) {
   useEditor.getState().patch((doc) => {
     if (t.kind === "base") {
-      const st: DevelopState = { adjustments: doc.adjustments, look: doc.look, lookAmount: doc.lookAmount }
+      const st: DevelopState = { adjustments: doc.adjustments, look: doc.look, lookAmount: doc.lookAmount, filters: { ...(doc.filters ?? {}) } }
       recipe(st)
       doc.adjustments = st.adjustments
       doc.look = st.look
       doc.lookAmount = st.lookAmount
+      doc.filters = st.filters
       return
     }
     const l = doc.layers.find((x) => x.id === t.id)
@@ -61,11 +66,13 @@ export function patchDevelop(t: AdjTarget, recipe: (d: DevelopState) => void, ke
       adjustments: l.adjustments ?? defaultAdjustments(),
       look: l.look ?? null,
       lookAmount: l.lookAmount ?? 1,
+      filters: { ...(l.filters ?? {}) },
     }
     recipe(st)
     l.adjustments = st.adjustments
     l.look = st.look
     l.lookAmount = st.lookAmount
+    l.filters = st.filters
   }, key && `${t.kind === "base" ? "base" : t.id}:${key}`)
 }
 

@@ -16,13 +16,26 @@ export function shiftLayer(l: Layer, dx: number, dy: number) {
     l.x += dx
     l.y += dy
   }
+  const move = (pts: number[] | undefined) => {
+    if (!pts) return
+    for (let i = 0; i < pts.length; i += 2) {
+      pts[i] += dx
+      pts[i + 1] += dy
+    }
+  }
+  if (l.type === "fill") {
+    l.x1 += dx
+    l.y1 += dy
+    l.x2 += dx
+    l.y2 += dy
+    move(l.clip)
+  }
   const lists = [l.mask ?? [], l.type === "effect" || l.type === "draw" ? l.strokes : []]
   for (const list of lists)
-    for (const s of list)
-      for (let i = 0; i < s.points.length; i += 2) {
-        s.points[i] += dx
-        s.points[i + 1] += dy
-      }
+    for (const s of list) {
+      move(s.points)
+      move(s.clip)
+    }
 }
 
 /** Commits the crop draft, keeping layers anchored to the image. */

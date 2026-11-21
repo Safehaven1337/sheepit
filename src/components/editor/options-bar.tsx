@@ -70,6 +70,9 @@ export function OptionsBar() {
       {tool === "shapes" && <ShapeOptions />}
       {tool === "privacy" && <PrivacyOptions />}
       {(tool === "hand" || tool === "zoom") && <ViewOptions />}
+      {tool === "gradient" && <GradientOptions />}
+      {tool === "bucket" && <BucketOptions />}
+      {(tool === "clone" || tool === "heal") && <StampOptions heal={tool === "heal"} />}
     </div>
   )
 }
@@ -548,3 +551,102 @@ function ViewOptions() {
   )
 }
 
+
+/* -------------------------------------------------------------- gradient */
+function GradientOptions() {
+  const g = useEditor((s) => s.gradient)
+  const set = useEditor((s) => s.setGradient)
+  const fg = useEditor((s) => s.fg)
+  const bg = useEditor((s) => s.bg)
+  const setColors = useEditor((s) => s.setColors)
+  const l = useSelectedLayer()
+  const fill = l?.type === "fill" ? l : null
+  const updateLayer = useEditor((s) => s.updateLayer)
+  return (
+    <>
+      <Seg
+        value={fill ? (fill.fill === "radial" ? "radial" : "linear") : g.type}
+        onChange={(v) => {
+          set({ type: v })
+          if (fill) updateLayer(fill.id, { fill: v } as Partial<Layer>)
+        }}
+        items={[
+          { v: "linear", label: "Linear" },
+          { v: "radial", label: "Radial" },
+        ]}
+      />
+      <Divider />
+      <ColorPicker label="Startfarbe (Vordergrund)" value={fill?.color ?? fg} onChange={(c) => {
+        if (!c) return
+        setColors({ fg: c })
+        if (fill) updateLayer(fill.id, { color: c } as Partial<Layer>)
+      }} />
+      <Seg
+        value={g.to}
+        onChange={(v) => {
+          set({ to: v })
+          if (fill) updateLayer(fill.id, { color2: v === "bg" ? bg : "transparent" } as Partial<Layer>)
+        }}
+        items={[
+          { v: "bg", label: "→ Hintergrundfarbe" },
+          { v: "transparent", label: "→ Transparent" },
+        ]}
+      />
+      {g.to === "bg" && (
+        <ColorPicker label="Endfarbe (Hintergrund)" value={fill && fill.color2 !== "transparent" ? fill.color2 : bg} onChange={(c) => {
+          if (!c) return
+          setColors({ bg: c })
+          if (fill) updateLayer(fill.id, { color2: c } as Partial<Layer>)
+        }} />
+      )}
+      <Divider />
+      <Label>Im Bild ziehen · Shift = 45° · wirkt nur in der Auswahl, falls vorhanden · erzeugt eine bearbeitbare Verlaufsebene</Label>
+    </>
+  )
+}
+
+function BucketOptions() {
+  const tol = useEditor((s) => s.bucketTolerance)
+  const setTol = useEditor((s) => s.setBucketTolerance)
+  const fg = useEditor((s) => s.fg)
+  const setColors = useEditor((s) => s.setColors)
+  return (
+    <>
+      <ColorPicker label="Füllfarbe" value={fg} onChange={(c) => c && setColors({ fg: c })} />
+      <MiniSlider label="Toleranz" value={tol} min={0} max={100} onChange={setTol} />
+      <Divider />
+      <Label>Klick füllt die zusammenhängende ähnliche Fläche (alle sichtbaren Ebenen) · Alt+Klick = Farbe aufnehmen</Label>
+    </>
+  )
+}
+
+function StampOptions({ heal }: { heal: boolean }) {
+  const st = useEditor((s) => s.stamp)
+  const setStamp = useEditor((s) => s.setStamp)
+  const source = useEditor((s) => s.cloneSource)
+  const setSource = useEditor((s) => s.setCloneSource)
+  return (
+    <>
+      <MiniSlider label="Größe" value={st.size} min={2} max={400} onChange={(v) => setStamp({ size: v })} />
+      {!heal && (
+        <>
+          <MiniSlider label="Härte" value={Math.round(st.hardness * 100)} min={0} max={100} onChange={(v) => setStamp({ hardness: v / 100 })} format={(v) => `${v}%`} />
+          <MiniSlider label="Deckkraft" value={Math.round(st.opacity * 100)} min={1} max={100} onChange={(v) => setStamp({ opacity: v / 100 })} format={(v) => `${v}%`} />
+          <Divider />
+          {source ? (
+            <Button size="xs" variant="ghost" onClick={() => setSource(null)}>
+              <X /> Quelle zurücksetzen
+            </Button>
+          ) : null}
+          <Label>{source ? "Malen kopiert von der Quelle (ausgerichtet)" : "Alt+Klick setzt die Quelle"}</Label>
+        </>
+      )}
+      {heal && (
+        <>
+          <Divider />
+          <Label>Über Pickel, Flecken, Stromleitungen oder kleine Objekte malen – Sheepit füllt sie aus der Umgebung auf.</Label>
+        </>
+      )}
+    </>
+  )
+}

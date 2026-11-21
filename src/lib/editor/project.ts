@@ -18,11 +18,17 @@ const extFor = (mime: string) =>
     mime
   ] ?? "bin"
 
-export async function saveProject(doc: SheepDoc, assets: Map<string, Asset>): Promise<Blob> {
+export async function saveProject(doc: SheepDoc, assets: Map<string, Asset>, opts: { preview?: boolean } = {}): Promise<Blob> {
   const files: Record<string, Uint8Array> = {}
   const used = new Set<string>()
   if (doc.baseAssetId) used.add(doc.baseAssetId)
-  for (const l of doc.layers) if (l.type === "image") used.add(l.assetId)
+  for (const l of doc.layers) {
+    if (l.type === "image") used.add(l.assetId)
+    // raster strokes: background removal masks, bucket fills, healing patches
+    for (const st of [...(l.mask ?? []), ...(l.type === "draw" || l.type === "effect" ? l.strokes : [])])
+      if (st.raster) used.add(st.raster)
+  }
+  for (const st of doc.baseMask ?? []) if (st.raster) used.add(st.raster)
   const index: Record<string, { file: string; mime: string; width: number; height: number }> = {}
   for (const id of used) {
     const a = assets.get(id)
@@ -36,7 +42,7 @@ export async function saveProject(doc: SheepDoc, assets: Map<string, Asset>): Pr
   )
   files["document.json"] = strToU8(JSON.stringify(doc))
   // preview
-  try {
+  if (opts.preview !== false) try {
     const { w, h } = docSize(doc)
     const scale = Math.min(1, 512 / Math.max(w, h))
     const c = renderDoc(doc, assets, { scale, background: "#ffffff" })

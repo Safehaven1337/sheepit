@@ -16,6 +16,7 @@ import {
   Unlock,
   Shapes,
   Image as ImageIcon,
+  PaintBucket,
 } from "lucide-react"
 import { useEditor } from "@/lib/editor/store"
 import { docSize, renderDoc } from "@/lib/editor/render"
@@ -51,6 +52,7 @@ const ICON: Record<Layer["type"], React.ElementType> = {
   shape: Shapes,
   effect: ShieldHalf,
   draw: Pencil,
+  fill: PaintBucket,
 }
 
 const THUMB = 44

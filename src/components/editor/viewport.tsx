@@ -3,13 +3,14 @@
 import * as React from "react"
 import { toast } from "sonner"
 import { useEditor } from "@/lib/editor/store"
-import { docSize, layerBounds, measureText, remapBaseMask, renderDoc, textFont } from "@/lib/editor/render"
+import { aabb, docSize, layerBounds, measureText, remapBaseMask, renderDoc, textFont } from "@/lib/editor/render"
 import { newEffect, newShape, newText, uid } from "@/lib/editor/defaults"
 import { ensureFont, fontFamilyFor } from "@/lib/editor/fonts"
 import { finishTextEdit } from "@/lib/editor/actions"
-import { ensurePaintLayer, selectionPolygon } from "@/lib/editor/ops"
+import { bucketFill, ensurePaintLayer, healStroke, selectionClip, selectionPolygon } from "@/lib/editor/ops"
+import { shiftLayer } from "@/lib/editor/actions"
 import { openContextMenu } from "./context-menu"
-import { BASE_ID, type Layer, type SelectionShape, type SheepDoc, type Stroke, type TextLayer } from "@/lib/editor/types"
+import { BASE_ID, type FillLayer, type Layer, type SelectionShape, type SheepDoc, type Stroke, type TextLayer } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
 type Pt = { x: number; y: number }
@@ -48,6 +49,8 @@ type Gesture =
   | { kind: "select"; start: Pt; points: number[]; moved: boolean }
   | { kind: "moveSelection"; start: Pt; orig: SelectionShape }
   | { kind: "crop"; mode: "move" | "resize"; hx: number; hy: number; start: Pt; orig: { x: number; y: number; w: number; h: number } }
+  | { kind: "gradient"; id: string; start: Pt; key: string }
+  | { kind: "heal"; stroke: Stroke; last: Pt }
 
 /** last brush point – shift+click draws a straight line from here (Photoshop) */
 let lastPaintPoint: Pt | null = null
@@ -81,6 +84,13 @@ export function Viewport({ className }: { className?: string }) {
   const [panning, setPanning] = React.useState(false)
   const [hoverId, setHoverId] = React.useState<string | null>(null)
   const [lasso, setLasso] = React.useState<number[] | null>(null)
+  const [guides, setGuides] = React.useState<{ v: number[]; h: number[] }>({ v: [], h: [] })
+  const [healPts, setHealPts] = React.useState<Stroke | null>(null)
+  const [dragTool, setDragTool] = React.useState<string | null>(null)
+  const stamp = useEditor((s) => s.stamp)
+  const cloneSource = useEditor((s) => s.cloneSource)
+  const cloneOffset = useEditor((s) => s.cloneOffset)
+  const showGrid = useEditor((s) => s.showGrid)
 
   const cropMode = tool === "crop" && !!doc.baseAssetId
   const viewDoc: SheepDoc = React.useMemo(
@@ -133,7 +143,7 @@ export function Viewport({ className }: { className?: string }) {
       const c = canvasRef.current
       if (!c) return
       const hide = editingText ? new Set([editingText]) : undefined
-      renderDoc(viewDoc, assets, { scale: renderScale, original: compare, hide, cacheBase: true }, c)
+      renderDoc(viewDoc, assets, { scale: renderScale, original: compare, hide, cacheBase: true, epoch: renderTick }, c)
       window.dispatchEvent(new Event("sheepit:rendered"))
     })
     return () => cancelAnimationFrame(id)
@@ -243,7 +253,7 @@ export function Viewport({ className }: { className?: string }) {
     const s = st()
     const erase = tool === "eraser"
     const set = erase ? s.eraser : s.brush
-    const stroke: Stroke = { points: [p.x, p.y], size: set.size / z, hardness: set.hardness, alpha: set.opacity }
+    const stroke: Stroke = { points: [p.x, p.y], size: set.size / z, hardness: set.hardness, alpha: set.opacity, ...selectionClip() }
     if (e.shiftKey && lastPaintPoint) stroke.points = [lastPaintPoint.x, lastPaintPoint.y, p.x, p.y]
     const key = `g:${uid()}`
     if (!erase) {
@@ -317,6 +327,78 @@ export function Viewport({ className }: { className?: string }) {
       zoomAt(z * (e.altKey ? 1 / 1.5 : 1.5), e.clientX, e.clientY)
       return
     }
+    if (tool === "bucket") {
+      if (e.altKey) return pickColor(p)
+      void bucketFill(p.x, p.y)
+      return
+    }
+    if (tool === "gradient") {
+      const fillL: FillLayer = {
+        id: uid(),
+        type: "fill",
+        name: "Verlauf",
+        visible: true,
+        locked: false,
+        opacity: 1,
+        blend: "source-over",
+        fill: s.gradient.type,
+        color: s.fg,
+        color2: s.gradient.to === "bg" ? s.bg : "transparent",
+        x1: p.x,
+        y1: p.y,
+        x2: p.x + 1,
+        y2: p.y,
+        ...(s.selection ? { clip: selectionPolygon(s.selection), clipInvert: !!s.selection.inverted } : {}),
+      }
+      const key = `g:${uid()}`
+      const idx = s.doc.layers.findIndex((l) => l.id === s.selectedId)
+      s.patch((d) => void d.layers.splice(idx < 0 ? d.layers.length : idx + 1, 0, fillL), key)
+      s.select(fillL.id)
+      gesture.current = { kind: "gradient", id: fillL.id, start: p, key }
+      setDragTool("gradient")
+      return
+    }
+    if (tool === "clone") {
+      if (e.altKey) {
+        s.setCloneSource(p)
+        toast.success("Quelle gesetzt – jetzt an der Zielstelle malen.")
+        return
+      }
+      if (!s.cloneSource) return void toast.info("Erst mit Alt+Klick eine Quelle setzen.")
+      const off = s.cloneOffset ?? { dx: s.cloneSource.x - p.x, dy: s.cloneSource.y - p.y }
+      if (!s.cloneOffset) s.setCloneOffset(off)
+      const size = s.stamp.size / z
+      const st: Stroke = { points: [p.x, p.y], size, hardness: s.stamp.hardness, ...selectionClip() }
+      const key = `g:${uid()}`
+      const cur = selected?.type === "effect" && selected.effect === "clone" && selected.dx === off.dx && selected.dy === off.dy ? selected : null
+      let id: string
+      if (cur) {
+        id = cur.id
+        s.patch((d) => {
+          const L = d.layers.find((x) => x.id === id)
+          if (L?.type === "effect") L.strokes.push(st)
+        }, key)
+      } else {
+        const l = newEffect("clone", "brush", 0, 0, 0, 0, Math.min(DW, DH))
+        l.dx = off.dx
+        l.dy = off.dy
+        l.strokes = [st]
+        l.opacity = s.stamp.opacity
+        id = l.id
+        const idx = s.doc.layers.findIndex((x) => x.id === s.selectedId)
+        s.patch((d) => void d.layers.splice(idx < 0 ? d.layers.length : idx + 1, 0, l), key)
+        s.select(l.id)
+      }
+      gesture.current = { kind: "paint", target: id, key, last: p, into: "strokes" }
+      return
+    }
+    if (tool === "heal") {
+      const st: Stroke = { points: [p.x, p.y], size: s.stamp.size / z, hardness: 1 }
+      gesture.current = { kind: "heal", stroke: st, last: p }
+      setHealPts({ ...st })
+      return
+    }
+
     if (tool === "eyedropper" || (e.altKey && (tool === "brush" || tool === "text" || tool === "shapes"))) {
       pickColor(p)
       return
@@ -383,7 +465,7 @@ export function Viewport({ className }: { className?: string }) {
         const l = newEffect(privacy.effect, "brush", 0, 0, 0, 0, Math.min(DW, DH))
         l.invert = !!privacy.invert
         if (l.invert) l.feather = Math.round(Math.min(DW, DH) * 0.02)
-        l.strokes = [{ points: [p.x, p.y], size }]
+        l.strokes = [{ points: [p.x, p.y], size, ...selectionClip() }]
         s.patch((d) => void d.layers.push(l), key)
         s.select(l.id)
         layer = l
@@ -391,7 +473,7 @@ export function Viewport({ className }: { className?: string }) {
         const id = layer.id
         s.patch((d) => {
           const L = d.layers.find((x) => x.id === id)
-          if (L?.type === "effect") L.strokes.push({ points: [p.x, p.y], size, erase: privacy.erase })
+          if (L?.type === "effect") L.strokes.push({ points: [p.x, p.y], size, erase: privacy.erase, ...selectionClip() })
         }, key)
       }
       gesture.current = { kind: "paint", target: layer.id, key, last: p, into: "strokes" }
@@ -472,21 +554,41 @@ export function Viewport({ className }: { className?: string }) {
           if (Math.abs(dx) > Math.abs(dy)) dy = 0
           else dx = 0
         }
+        // smart guides: snap edges/centres to the canvas and other layers (Ctrl disables)
+        const ob = layerBounds(g.orig)
+        if (ob && !(e.ctrlKey || e.metaKey)) {
+          const r = aabb(ob)
+          const tol = 6 / z
+          const xs = [0, DW / 2, DW]
+          const ys = [0, DH / 2, DH]
+          for (const o of doc.layers) {
+            if (o.id === g.id || !o.visible) continue
+            const b2 = layerBounds(o)
+            if (!b2 || (o.type === "effect" && o.region === "brush")) continue
+            const q = aabb(b2)
+            xs.push(q.x, q.x + q.w / 2, q.x + q.w)
+            ys.push(q.y, q.y + q.h / 2, q.y + q.h)
+          }
+          const snap1 = (vals: number[], cands: number[]) => {
+            let best: { d: number; at: number } | null = null
+            for (const v of vals)
+              for (const c of cands) {
+                const dd = c - v
+                if (Math.abs(dd) < tol && (!best || Math.abs(dd) < Math.abs(best.d))) best = { d: dd, at: c }
+              }
+            return best
+          }
+          const sx = snap1([r.x + dx, r.x + r.w / 2 + dx, r.x + r.w + dx], xs)
+          const sy = snap1([r.y + dy, r.y + r.h / 2 + dy, r.y + r.h + dy], ys)
+          if (sx) dx += sx.d
+          if (sy) dy += sy.d
+          setGuides({ v: sx ? [sx.at] : [], h: sy ? [sy.at] : [] })
+        }
         s.patch((d) => {
           const i = d.layers.findIndex((l) => l.id === g.id)
           if (i < 0) return
           const L = structuredClone(g.orig)
-          if ("x" in L) {
-            L.x += dx
-            L.y += dy
-          }
-          const lists = [L.mask ?? [], L.type === "effect" || L.type === "draw" ? L.strokes : []]
-          for (const list of lists)
-            for (const stx of list)
-              for (let k = 0; k < stx.points.length; k += 2) {
-                stx.points[k] += dx
-                stx.points[k + 1] += dy
-              }
+          shiftLayer(L, dx, dy)
           d.layers[i] = L
         }, g.key)
         break
@@ -572,6 +674,24 @@ export function Viewport({ className }: { className?: string }) {
         } else if (line) {
           s.updateLayer(g.id, { x: g.start.x, y: g.start.y, width: p.x - g.start.x, height: p.y - g.start.y } as Partial<Layer>, g.key)
         } else s.updateLayer(g.id, { x, y, width: w, height: h } as Partial<Layer>, g.key)
+        break
+      }
+      case "gradient": {
+        let q = p
+        if (e.shiftKey) {
+          // snap to 45° steps
+          const ang = Math.round(Math.atan2(p.y - g.start.y, p.x - g.start.x) / (Math.PI / 4)) * (Math.PI / 4)
+          const len = Math.hypot(p.x - g.start.x, p.y - g.start.y)
+          q = { x: g.start.x + Math.cos(ang) * len, y: g.start.y + Math.sin(ang) * len }
+        }
+        s.updateLayer(g.id, { x2: q.x, y2: q.y } as Partial<Layer>, g.key)
+        break
+      }
+      case "heal": {
+        if (Math.hypot(p.x - g.last.x, p.y - g.last.y) < 1.5 / z) break
+        g.last = p
+        g.stroke.points.push(p.x, p.y)
+        setHealPts({ ...g.stroke, points: [...g.stroke.points] })
         break
       }
       case "paint": {
@@ -668,6 +788,16 @@ export function Viewport({ className }: { className?: string }) {
       return
     }
     if (g?.kind === "paint") lastPaintPoint = g.last
+    if (g?.kind === "move") setGuides({ v: [], h: [] })
+    if (g?.kind === "gradient") setDragTool(null)
+    if (g?.kind === "heal") {
+      const st = g.stroke
+      const id = toast.loading("Repariere …")
+      void healStroke(st).then(() => {
+        toast.dismiss(id)
+        setHealPts(null)
+      })
+    }
     if (g?.kind === "select") {
       if (!g.moved) st().setSelection(null)
       else if (selectMode === "lasso" && g.points.length >= 6) st().setSelection({ kind: "lasso", points: g.points })
@@ -685,6 +815,7 @@ export function Viewport({ className }: { className?: string }) {
     if (s.editingText) finishTextEdit()
     const at = { x: e.clientX, y: e.clientY }
     if (tool === "brush" || tool === "eraser") return openContextMenu({ ...at, kind: tool })
+    if (tool === "clone" || tool === "heal") return openContextMenu({ ...at, kind: "stamp" })
     if (tool === "privacy" && (privacy.region === "brush" || privacy.erase)) return openContextMenu({ ...at, kind: "privacy-brush" })
     const p = toDoc(e.clientX, e.clientY)
     if (selection && (tool === "select" || (!selection.inverted && pointInPoly(p, selectionPolygon(selection))) || selection.inverted))
@@ -712,8 +843,10 @@ export function Viewport({ className }: { className?: string }) {
   }
 
   const hs = 9 / z
-  const isBrushTool = tool === "brush" || tool === "eraser" || (tool === "privacy" && (privacy.region === "brush" || privacy.erase))
-  const brushPx = tool === "brush" ? brush.size : tool === "eraser" ? eraser.size : privacy.brushSize
+  const isBrushTool =
+    tool === "brush" || tool === "eraser" || tool === "clone" || tool === "heal" || (tool === "privacy" && (privacy.region === "brush" || privacy.erase))
+  const brushPx =
+    tool === "brush" ? brush.size : tool === "eraser" ? eraser.size : tool === "clone" || tool === "heal" ? stamp.size : privacy.brushSize
   const brushR = brushPx / z / 2
   const cursorClass = panning
     ? "cursor-grabbing"
@@ -723,13 +856,13 @@ export function Viewport({ className }: { className?: string }) {
         ? altDown
           ? "cursor-zoom-out"
           : "cursor-zoom-in"
-        : tool === "eyedropper" || (altDown && (tool === "brush" || tool === "text" || tool === "shapes"))
+        : tool === "eyedropper" || (altDown && (tool === "brush" || tool === "text" || tool === "shapes" || tool === "bucket"))
           ? "cursor-copy"
           : isBrushTool
             ? "cursor-none"
             : tool === "text"
               ? "cursor-text"
-              : tool === "select" || tool === "privacy" || tool === "shapes" || tool === "crop"
+              : tool === "select" || tool === "privacy" || tool === "shapes" || tool === "crop" || tool === "gradient" || tool === "bucket"
                 ? "cursor-crosshair"
                 : "cursor-default"
 
@@ -807,7 +940,52 @@ export function Viewport({ className }: { className?: string }) {
 
           {cropMode && crop.rect && <CropOverlay rect={crop.rect} W={DW} H={DH} hs={hs} z={z} />}
 
+          {showGrid && !cropMode && <Grid W={DW} H={DH} z={z} />}
+
           {selPoly && !cropMode && <MarchingAnts points={selPoly} z={z} inverted={!!selection?.inverted} W={DW} H={DH} />}
+
+          {/* smart guides */}
+          {guides.v.map((x) => (
+            <line key={`v${x}`} x1={x} y1={-1e4} x2={x} y2={1e4} stroke="#ff3bd4" strokeWidth={1 / z} />
+          ))}
+          {guides.h.map((y) => (
+            <line key={`h${y}`} x1={-1e4} y1={y} x2={1e4} y2={y} stroke="#ff3bd4" strokeWidth={1 / z} />
+          ))}
+
+          {/* healing stroke preview */}
+          {healPts && (
+            <path
+              d={healPts.points.reduce((acc, v, i) => (i % 2 ? acc + ` ${v}` : acc + `${i ? "L" : "M"}${v}`), "")}
+              fill="none"
+              stroke="#ff4d6d"
+              strokeOpacity={0.45}
+              strokeWidth={healPts.size}
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          )}
+
+          {/* gradient direction while dragging */}
+          {tool === "gradient" && selected?.type === "fill" && selected.fill !== "solid" && dragTool === "gradient" && (
+            <g>
+              <line x1={selected.x1} y1={selected.y1} x2={selected.x2} y2={selected.y2} stroke="black" strokeOpacity={0.5} strokeWidth={3 / z} />
+              <line x1={selected.x1} y1={selected.y1} x2={selected.x2} y2={selected.y2} stroke="white" strokeWidth={1.25 / z} />
+              <circle cx={selected.x1} cy={selected.y1} r={4 / z} fill="white" />
+            </g>
+          )}
+
+          {/* clone source crosshair */}
+          {tool === "clone" && (cloneOffset && cursor ? { x: cursor.x + cloneOffset.dx, y: cursor.y + cloneOffset.dy } : cloneSource) && (() => {
+            const c = cloneOffset && cursor ? { x: cursor.x + cloneOffset.dx, y: cursor.y + cloneOffset.dy } : cloneSource!
+            const r = brushR
+            return (
+              <g>
+                <circle cx={c.x} cy={c.y} r={r} fill="none" stroke="white" strokeDasharray={`${3 / z} ${3 / z}`} strokeWidth={1 / z} />
+                <line x1={c.x - r * 0.4} y1={c.y} x2={c.x + r * 0.4} y2={c.y} stroke="white" strokeWidth={1 / z} />
+                <line x1={c.x} y1={c.y - r * 0.4} x2={c.x} y2={c.y + r * 0.4} stroke="white" strokeWidth={1 / z} />
+              </g>
+            )
+          })()}
           {lasso && lasso.length >= 4 && <MarchingAnts points={lasso} z={z} open />}
 
           {isBrushTool && cursor && !panning && (
@@ -824,6 +1002,21 @@ export function Viewport({ className }: { className?: string }) {
         {editLayer && <InlineTextEditor layer={editLayer} />}
       </div>
     </div>
+  )
+}
+
+function Grid({ W, H, z }: { W: number; H: number; z: number }) {
+  // ~ 8 cells across the short side, rounded to a "nice" step
+  const raw = Math.min(W, H) / 8
+  const p = Math.pow(10, Math.floor(Math.log10(raw)))
+  const step = [1, 2, 5, 10].map((m) => m * p).find((v) => v >= raw) ?? raw
+  const lines: React.ReactNode[] = []
+  for (let x = step; x < W; x += step) lines.push(<line key={`x${x}`} x1={x} y1={0} x2={x} y2={H} />)
+  for (let y = step; y < H; y += step) lines.push(<line key={`y${y}`} x1={0} y1={y} x2={W} y2={y} />)
+  return (
+    <g stroke="white" strokeOpacity={0.22} strokeWidth={1 / z}>
+      {lines}
+    </g>
   )
 }
 

@@ -8,6 +8,8 @@ import { ACCEPT } from "@/lib/editor/handoff"
 import { BorderBeam } from "@/components/ui/border-beam"
 import { SheepMark } from "@/components/brand/sheep-logo"
 import { cn } from "@/lib/utils"
+import { clearAutosave, readAutosave, type AutosaveEntry } from "./autosave"
+import { History, X } from "lucide-react"
 
 const BLANKS = [
   { label: "Instagram Post", w: 1080, h: 1080, icon: Square },
@@ -24,6 +26,7 @@ export function DropScreen({ hint, onNew }: { hint?: string; onNew?: () => void 
   return (
     <div className="flex h-full w-full items-center justify-center overflow-y-auto p-4 md:p-10">
       <div className="grid w-full max-w-2xl gap-6">
+        <RestoreCard />
         <div
           role="button"
           tabIndex={0}
@@ -104,6 +107,57 @@ export function DropScreen({ hint, onNew }: { hint?: string; onNew?: () => void 
           <ImagePlus className="hidden" />
         </p>
       </div>
+    </div>
+  )
+}
+
+function ago(t: number) {
+  const m = Math.round((Date.now() - t) / 60000)
+  if (m < 1) return "gerade eben"
+  if (m < 60) return `vor ${m} Min.`
+  const h = Math.round(m / 60)
+  if (h < 24) return `vor ${h} Std.`
+  return `vor ${Math.round(h / 24)} Tagen`
+}
+
+/** Offers to continue the last (autosaved) project after a refresh or crash. */
+function RestoreCard() {
+  const [entry, setEntry] = React.useState<AutosaveEntry | null>(null)
+  React.useEffect(() => {
+    readAutosave().then(setEntry)
+  }, [])
+  if (!entry) return null
+  return (
+    <div className="flex items-center gap-4 rounded-2xl border border-primary/30 bg-primary/[0.06] p-3 pr-4">
+      {entry.thumb ? (
+        // eslint-disable-next-line @next/next/no-img-element
+        <img src={entry.thumb} alt="" className="h-14 w-20 shrink-0 rounded-lg object-cover ring-1 ring-white/10" />
+      ) : (
+        <History className="size-8 text-primary" />
+      )}
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-semibold">Weitermachen: {entry.name || "Unbenannt"}</p>
+        <p className="text-[12px] text-muted-foreground">Automatisch gesichert {ago(entry.time)} · nur auf diesem Gerät</p>
+      </div>
+      <button
+        type="button"
+        onClick={() => openFile(new File([entry.blob], `${entry.name || "projekt"}.sheepit`))}
+        className="h-8 shrink-0 rounded-lg bg-primary px-3 text-[13px] font-semibold text-primary-foreground hover:brightness-110"
+      >
+        Wiederherstellen
+      </button>
+      <button
+        type="button"
+        aria-label="Verwerfen"
+        title="Verwerfen"
+        onClick={() => {
+          void clearAutosave()
+          setEntry(null)
+        }}
+        className="grid size-8 shrink-0 place-items-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground"
+      >
+        <X className="size-4" />
+      </button>
     </div>
   )
 }

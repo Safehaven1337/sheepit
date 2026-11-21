@@ -3,10 +3,13 @@
 // Photoshop-style document operations: layers, selection, merge/flatten, clipboard.
 import { toast } from "sonner"
 import { defaultAdjustments, defaultGeometry, newDraw, newEffect, uid } from "./defaults"
-import { docSize, invalidateRenderCache, layerBounds, renderDoc, rotatedSize } from "./render"
+import { aabb, docSize, invalidateRenderCache, layerBounds, renderDoc, rotatedSize } from "./render"
+import { drawStroke } from "./effects"
+import { floodFill, healRegion } from "./heal"
+import { backgroundMask } from "./segment"
 import { blobToAsset, useEditor } from "./store"
 import { shiftLayer } from "./actions"
-import { BASE_ID, type DrawLayer, type ImageLayer, type Layer, type SelectionShape, type SheepDoc, type Stroke } from "./types"
+import { BASE_ID, type Asset, type DrawLayer, type ImageLayer, type Layer, type SelectionShape, type SheepDoc, type Stroke } from "./types"
 
 const get = () => useEditor.getState()
 
@@ -131,19 +134,19 @@ async function canvasToImageLayer(c: HTMLCanvasElement, name: string): Promise<I
 
 /* ------------------------------------------------------------------- layers */
 
-export function newLayer() {
+export function newLayer(name?: string) {
   const l = newDraw()
-  l.name = nextLayerName()
+  l.name = name ?? nextLayerName()
   get().addLayer(l, true, layerIndexAboveSelection())
   return l.id
 }
 
 /** Returns the paint layer brush strokes go into (creates one when needed). */
-export function ensurePaintLayer(): string {
+export function ensurePaintLayer(name?: string): string {
   const s = get()
   const sel = s.doc.layers.find((l) => l.id === s.selectedId)
-  if (sel?.type === "draw" && !sel.locked) return sel.id
-  return newLayer()
+  if (sel?.type === "draw" && !sel.locked && (!name || sel.name.startsWith(name))) return sel.id
+  return newLayer(name)
 }
 
 export function selectedLayer(): Layer | null {
@@ -233,9 +236,20 @@ export async function flattenImage() {
   toast.success("Auf Hintergrundebene reduziert")
 }
 
+/** assets a layer depends on (image layers, raster strokes) - kept with the clipboard */
+let clipboardAssets = new Map<string, Asset>()
+function layerAssetIds(l: Layer): string[] {
+  const ids: string[] = []
+  if (l.type === "image") ids.push(l.assetId)
+  for (const st of [...(l.mask ?? []), ...(l.type === "draw" || l.type === "effect" ? l.strokes : [])]) if (st.raster) ids.push(st.raster)
+  return ids
+}
+
 export function copyLayer(cut = false) {
   const l = selectedLayer()
   if (!l) return false
+  const assets = get().assets
+  clipboardAssets = new Map(layerAssetIds(l).filter((id) => assets.has(id)).map((id) => [id, assets.get(id)!]))
   get().setClipboard(structuredClone(l))
   if (cut) get().removeLayer(l.id)
   return true
@@ -246,6 +260,13 @@ export function pasteLayer() {
   if (!c) return false
   const l = structuredClone(c)
   l.id = uid()
+  // pasting into another document: bring the pixels along
+  const missing = [...clipboardAssets.entries()].filter(([id]) => !get().assets.has(id))
+  if (missing.length) {
+    const assets = new Map(get().assets)
+    for (const [id, a] of missing) assets.set(id, a)
+    useEditor.setState({ assets })
+  }
   shiftLayer(l, 20, 20)
   get().addLayer(l, true, layerIndexAboveSelection())
   get().setClipboard(structuredClone(l))
@@ -397,4 +418,176 @@ export function newDocument(w: number, h: number, bg: string, name?: string) {
 
 export function docHasContent(doc: SheepDoc) {
   return !!doc.baseAssetId || doc.layers.length > 0
+}
+
+/* ------------------------------------------------------ painting helpers */
+
+/** Clip info so brush strokes stay inside the active selection (Photoshop behaviour). */
+export function selectionClip(): Pick<Stroke, "clip" | "clipInvert"> {
+  const sel = get().selection
+  if (!sel) return {}
+  return { clip: selectionPolygon(sel), clipInvert: !!sel.inverted }
+}
+
+/** Renders everything visible (like "Alle Ebenen aufnehmen") at 100 %. */
+function renderVisible() {
+  const s = get()
+  return renderLayers(s.doc.layers.filter((l) => l.visible), true, null, true)
+}
+
+/** Adds a raster patch (doc-px rect) as a stroke to the active paint layer. */
+async function addRasterToPaintLayer(c: HTMLCanvasElement, x: number, y: number, name?: string) {
+  const a = await get().addAsset(await canvasToBlob(c))
+  const id = ensurePaintLayer(name)
+  get().patch((d) => {
+    const L = d.layers.find((l) => l.id === id)
+    if (L?.type === "draw")
+      L.strokes.push({ points: [x, y, x + c.width, y, x, y + c.height], size: 0, raster: a.id, color: "#000" })
+  })
+}
+
+/** Farbeimer: fills the contiguous similar area (sampled from all visible layers). */
+export async function bucketFill(px: number, py: number) {
+  const s = get()
+  const { w, h } = docSize(s.doc)
+  const x = Math.floor(px)
+  const y = Math.floor(py)
+  if (x < 0 || y < 0 || x >= w || y >= h) return
+  const comp = renderVisible()
+  const ctx = comp.getContext("2d", { willReadFrequently: true })!
+  const data = ctx.getImageData(0, 0, comp.width, comp.height).data
+  let limit: Uint8Array | undefined
+  if (s.selection) {
+    const m = document.createElement("canvas")
+    m.width = comp.width
+    m.height = comp.height
+    const mc = m.getContext("2d", { willReadFrequently: true })!
+    mc.beginPath()
+    if (s.selection.inverted) mc.rect(0, 0, m.width, m.height)
+    const p = selectionPolygon(s.selection)
+    mc.moveTo(p[0], p[1])
+    for (let i = 2; i < p.length; i += 2) mc.lineTo(p[i], p[i + 1])
+    mc.closePath()
+    mc.fill(s.selection.inverted ? "evenodd" : "nonzero")
+    const md = mc.getImageData(0, 0, m.width, m.height).data
+    limit = new Uint8Array(m.width * m.height)
+    for (let i = 0; i < limit.length; i++) limit[i] = md[i * 4 + 3] > 127 ? 1 : 0
+    if (!limit[y * m.width + x]) return
+  }
+  const filled = floodFill(data, comp.width, comp.height, x, y, s.bucketTolerance, limit)
+  let x0 = comp.width, y0 = comp.height, x1 = -1, y1 = -1
+  for (let yy = 0; yy < comp.height; yy++)
+    for (let xx = 0; xx < comp.width; xx++)
+      if (filled[yy * comp.width + xx]) {
+        if (xx < x0) x0 = xx
+        if (xx > x1) x1 = xx
+        if (yy < y0) y0 = yy
+        if (yy > y1) y1 = yy
+      }
+  if (x1 < 0) return
+  const cw = x1 - x0 + 1
+  const ch = y1 - y0 + 1
+  const out = document.createElement("canvas")
+  out.width = cw
+  out.height = ch
+  const oc = out.getContext("2d")!
+  const img = oc.createImageData(cw, ch)
+  const hex = s.fg.replace("#", "")
+  const r = parseInt(hex.slice(0, 2), 16)
+  const g = parseInt(hex.slice(2, 4), 16)
+  const b = parseInt(hex.slice(4, 6), 16)
+  for (let yy = 0; yy < ch; yy++)
+    for (let xx = 0; xx < cw; xx++) {
+      if (!filled[(yy + y0) * comp.width + xx + x0]) continue
+      const o = (yy * cw + xx) * 4
+      img.data[o] = r
+      img.data[o + 1] = g
+      img.data[o + 2] = b
+      img.data[o + 3] = 255
+    }
+  oc.putImageData(img, 0, 0)
+  await addRasterToPaintLayer(out, x0, y0)
+}
+
+/** Bereichsreparatur: reconstructs the painted area from its surroundings. */
+export async function healStroke(stroke: Stroke) {
+  const s = get()
+  const { w, h } = docSize(s.doc)
+  const pts = stroke.points
+  const r = stroke.size / 2
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity
+  for (let i = 0; i < pts.length; i += 2) {
+    x0 = Math.min(x0, pts[i] - r)
+    y0 = Math.min(y0, pts[i + 1] - r)
+    x1 = Math.max(x1, pts[i] + r)
+    y1 = Math.max(y1, pts[i + 1] + r)
+  }
+  const margin = Math.max(8, stroke.size)
+  const bx = Math.max(0, Math.floor(x0 - margin))
+  const by = Math.max(0, Math.floor(y0 - margin))
+  const bw = Math.min(w, Math.ceil(x1 + margin)) - bx
+  const bh = Math.min(h, Math.ceil(y1 + margin)) - by
+  if (bw < 2 || bh < 2) return
+  const comp = renderVisible()
+  const data = comp.getContext("2d", { willReadFrequently: true })!.getImageData(bx, by, bw, bh).data
+  const m = document.createElement("canvas")
+  m.width = bw
+  m.height = bh
+  const mc = m.getContext("2d", { willReadFrequently: true })!
+  mc.translate(-bx, -by)
+  mc.fillStyle = "#000"
+  mc.strokeStyle = "#000"
+  drawStroke(mc, { ...stroke, hardness: 1, alpha: 1 }, 1)
+  const md = mc.getImageData(0, 0, bw, bh).data
+  const fill = new Uint8Array(bw * bh)
+  for (let i = 0; i < fill.length; i++) fill[i] = md[i * 4 + 3] > 40 ? 1 : 0
+  const patch = healRegion(data, fill, bw, bh)
+  const out = document.createElement("canvas")
+  out.width = bw
+  out.height = bh
+  out.getContext("2d")!.putImageData(patch, 0, 0)
+  await addRasterToPaintLayer(out, bx, by, "Reparatur")
+}
+
+/** Hintergrund entfernen: person segmentation → raster erase mask (background photo or image layer). */
+export async function removeBackground() {
+  const s = get()
+  const id = toast.loading("Erkenne Person … (läuft lokal auf deinem Gerät)")
+  try {
+    const layer = s.selectedId && s.selectedId !== BASE_ID ? selectedLayer() : null
+    if (layer && layer.type !== "image") {
+      toast.info("Hintergrund entfernen funktioniert mit dem Foto oder einer Bildebene.", { id })
+      return
+    }
+    if (!layer && !s.doc.baseAssetId) {
+      toast.info("Öffne zuerst ein Foto.", { id })
+      return
+    }
+    const src = layer
+      ? renderLayers([{ ...layer, mask: [], opacity: 1, blend: "source-over", visible: true }], false)
+      : renderLayers([], true)
+    const box = layer ? layerBounds(layer) : null
+    const r = box ? aabb(box) : { x: 0, y: 0, w: src.width, h: src.height }
+    const x = Math.max(0, Math.floor(r.x))
+    const y = Math.max(0, Math.floor(r.y))
+    const w = Math.min(src.width, Math.ceil(r.x + r.w)) - x
+    const h = Math.min(src.height, Math.ceil(r.y + r.h)) - y
+    const crop = document.createElement("canvas")
+    crop.width = w
+    crop.height = h
+    crop.getContext("2d")!.drawImage(src, x, y, w, h, 0, 0, w, h)
+    const mask = await backgroundMask(crop)
+    const asset = await get().addAsset(await canvasToBlob(mask))
+    const op: Stroke = { points: [x, y, x + w, y, x, y + h], size: 0, raster: asset.id }
+    if (layer)
+      s.patch((d) => {
+        const L = d.layers.find((l) => l.id === layer.id)
+        if (L) L.mask = [...(L.mask ?? []), op]
+      })
+    else s.patch((d) => void (d.baseMask = [...(d.baseMask ?? []), op]))
+    toast.success("Hintergrund entfernt – mit dem Radierer oder Strg+Z nachbessern.", { id })
+  } catch (e) {
+    console.error(e)
+    toast.error("Freistellen fehlgeschlagen.", { id })
+  }
 }

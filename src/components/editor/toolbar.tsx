@@ -14,6 +14,10 @@ import {
   SquareDashed,
   Type,
   ZoomIn,
+  Blend,
+  PaintBucket,
+  Stamp,
+  Bandage,
 } from "lucide-react"
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip"
 import { useEditor } from "@/lib/editor/store"
@@ -28,6 +32,10 @@ export const TOOLS: { id: ToolId; label: string; icon: React.ElementType; key: s
   { id: "eyedropper", label: "Pipette", icon: Pipette, key: "i", hint: "Farbe aus dem Bild aufnehmen (auch Alt+Klick)" },
   { id: "brush", label: "Pinsel", icon: Brush, key: "b", hint: "Malen auf einer Ebene" },
   { id: "eraser", label: "Radierer", icon: Eraser, key: "e", hint: "Auf der aktiven Ebene radieren" },
+  { id: "gradient", label: "Verlauf", icon: Blend, key: "g", hint: "Ziehen = Farbverlauf (Shift = 45°)" },
+  { id: "bucket", label: "Füllen", icon: PaintBucket, key: "k", hint: "Farbeimer: ähnliche Fläche füllen" },
+  { id: "clone", label: "Stempel", icon: Stamp, key: "s", hint: "Kopierstempel: Alt+Klick = Quelle, dann malen" },
+  { id: "heal", label: "Reparieren", icon: Bandage, key: "j", hint: "Bereichsreparatur: über Störendes malen – es verschwindet" },
   { id: "text", label: "Text", icon: Type, key: "t", hint: "Ins Bild klicken und tippen" },
   { id: "shapes", label: "Formen", icon: Shapes, key: "u", hint: "Rechteck, Ellipse, Linie, Pfeil" },
   { id: "privacy", label: "Unkenntlich", icon: ShieldHalf, key: "p", hint: "Verpixeln, weichzeichnen, schwärzen" },
@@ -47,7 +55,7 @@ export function Toolbar({ orientation = "vertical" }: { orientation?: "vertical"
       aria-label="Werkzeuge"
       className={cn(
         "flex shrink-0 gap-0.5 bg-background/70",
-        vertical ? "w-12 flex-col items-center border-r border-white/6 py-2" : "overflow-x-auto border-t border-white/6 px-2 py-1",
+        vertical ? "w-12 flex-col items-center overflow-y-auto border-r border-white/6 py-1.5 [scrollbar-width:none]" : "overflow-x-auto border-t border-white/6 px-2 py-1",
       )}
     >
       {TOOLS.map(({ id, label, icon: Icon, key, hint }) => (
@@ -61,7 +69,7 @@ export function Toolbar({ orientation = "vertical" }: { orientation?: "vertical"
                 aria-label={label}
                 className={cn(
                   "grid shrink-0 place-items-center rounded-lg text-muted-foreground transition hover:bg-muted/70 hover:text-foreground",
-                  vertical ? "size-9" : "h-11 min-w-12 gap-0.5",
+                  vertical ? "size-8" : "h-11 min-w-12 gap-0.5",
                   tool === id && "bg-primary/15 text-primary hover:bg-primary/20 hover:text-primary",
                 )}
               >

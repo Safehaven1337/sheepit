@@ -152,6 +152,7 @@ export const EFFECT_LABEL: Record<EffectLayer["effect"], string> = {
   redact: "Schwärzen",
   noise: "Rauschen",
   glass: "Milchglas",
+  clone: "Kopierstempel",
 }
 
 export const newEffect = (

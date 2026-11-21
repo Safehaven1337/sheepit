@@ -17,6 +17,9 @@ import { LayersPanel } from "./layers-panel"
 import { ExportDialog } from "./export-dialog"
 import { NewDocDialog } from "./new-doc-dialog"
 import { ContextMenuHost } from "./context-menu"
+import { HistoryPanel } from "./history-panel"
+import { ShortcutsDialog } from "./shortcuts-dialog"
+import { clearAutosave, useAutosave } from "./autosave"
 import { MenuBar, type UiCommand } from "./menu-bar"
 import { OptionsBar } from "./options-bar"
 import { Toolbar, TOOLS } from "./toolbar"
@@ -32,13 +35,14 @@ import {
   mergeDown,
   newLayer,
   pasteLayer,
+  removeBackground,
   selectAll,
 } from "@/lib/editor/ops"
 import { takePendingFile, ACCEPT } from "@/lib/editor/handoff"
 import { presetBySlug, type EditorPreset } from "@/lib/seo/tools"
 import { saveProject, downloadBlob, type ExportFormat } from "@/lib/editor/project"
 import { docSize } from "@/lib/editor/render"
-import { targetOf } from "@/lib/editor/target"
+import { currentTarget, patchDevelop, targetOf } from "@/lib/editor/target"
 import { BASE_ID, type Layer } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
@@ -76,6 +80,8 @@ export function EditorApp() {
   const selectedId = useEditor((s) => s.selectedId)
   const [exportOpen, setExportOpen] = React.useState(false)
   const [newOpen, setNewOpen] = React.useState(false)
+  const [helpOpen, setHelpOpen] = React.useState(false)
+  useAutosave()
   const [exportInit, setExportInit] = React.useState<{ format?: ExportFormat; quality?: number }>()
   const [mobilePanel, setMobilePanel] = React.useState(false)
   const [mobileLayers, setMobileLayers] = React.useState(false)
@@ -85,7 +91,14 @@ export function EditorApp() {
 
   React.useEffect(() => {
     if (process.env.NODE_ENV !== "production")
-      (window as unknown as Record<string, unknown>).__sheepit = { useEditor, saveProject, openFile, autoDetectFaces }
+      (window as unknown as Record<string, unknown>).__sheepit = {
+        useEditor,
+        saveProject,
+        openFile,
+        autoDetectFaces,
+        ops: () => import("@/lib/editor/ops"),
+        render: () => import("@/lib/editor/render"),
+      }
   }, [])
 
   // UI commands from menus
@@ -97,7 +110,11 @@ export function EditorApp() {
       if (cmd === "place") placeInput.current?.click()
       if (cmd === "save") saveSheepit()
       if (cmd === "export") setExportOpen(true)
-      if (cmd === "close" && (!useEditor.getState().dirty || confirm("Ungespeicherte Änderungen verwerfen?"))) useEditor.getState().close()
+      if (cmd === "help") setHelpOpen(true)
+      if (cmd === "close" && (!useEditor.getState().dirty || confirm("Ungespeicherte Änderungen verwerfen?"))) {
+        useEditor.getState().close()
+        void clearAutosave()
+      }
     }
     window.addEventListener("sheepit:ui", on)
     return () => window.removeEventListener("sheepit:ui", on)
@@ -194,7 +211,13 @@ export function EditorApp() {
       if (mod && k === "a") return run(selectAll)
       if (mod && k === "d") return run(() => s.setSelection(null))
       if (mod && e.shiftKey && k === "i") return run(invertSelection)
+      if (mod && !e.shiftKey && k === "i")
+        return run(() => {
+          const t = currentTarget()
+          if (t) patchDevelop(t, (d) => void (d.filters = { ...d.filters, invert: !d.filters.invert }))
+        })
       if (mod && e.shiftKey && k === "l") return run(autoEnhance)
+      if (mod && (e.key === "'" || e.key === "#")) return run(() => s.setShowGrid(!s.showGrid))
       if (mod && (e.key === "0" || e.key === "1")) return run(() => s.setZoom(e.key === "0" ? 0 : 1))
       if (mod && (e.key === "+" || e.key === "=")) return run(() => s.setZoom((s.zoom || s.fitZoom) * 1.25))
       if (mod && e.key === "-") return run(() => s.setZoom((s.zoom || s.fitZoom) / 1.25))
@@ -230,11 +253,12 @@ export function EditorApp() {
       if (e.key === "\\" && !e.repeat) return s.setCompare(true)
       if (mod || e.altKey) return
       // brush size / hardness / opacity
-      const brushTool = s.tool === "brush" || s.tool === "eraser" || s.tool === "privacy"
+      const brushTool = s.tool === "brush" || s.tool === "eraser" || s.tool === "privacy" || s.tool === "clone" || s.tool === "heal"
       if (brushTool && (e.key === "[" || e.key === "]" || e.key === "{" || e.key === "}")) {
         const up = e.key === "]" || e.key === "}"
         const hardness = e.shiftKey || e.key === "{" || e.key === "}"
         if (s.tool === "privacy") return s.setPrivacy({ brushSize: Math.max(2, s.privacy.brushSize * (up ? 1.15 : 1 / 1.15)) })
+        if (s.tool === "clone" || s.tool === "heal") return s.setStamp({ size: Math.min(400, Math.max(2, Math.round(s.stamp.size * (up ? 1.15 : 1 / 1.15)))) })
         const set = s.tool === "eraser" ? s.setEraser : s.setBrush
         const cur = s.tool === "eraser" ? s.eraser : s.brush
         if (hardness) return set({ hardness: Math.min(1, Math.max(0, cur.hardness + (up ? 0.25 : -0.25))) })
@@ -244,8 +268,11 @@ export function EditorApp() {
         const v = e.key === "0" ? 1 : Number(e.key) / 10
         return (s.tool === "eraser" ? s.setEraser : s.setBrush)({ opacity: v })
       }
+      if (e.key === "?" || e.key === "F1") return run(() => setHelpOpen(true))
       if (k === "x") return s.setColors({ fg: s.bg, bg: s.fg })
       if (k === "d") return s.setColors({ fg: "#000000", bg: "#ffffff" })
+      // like Photoshop: pressing G again toggles gradient ↔ bucket
+      if (k === "g" && s.tool === "gradient") return switchTool("bucket")
       const tl = TOOLS.find((x) => x.key === k)
       if (tl) switchTool(tl.id)
     }
@@ -266,8 +293,9 @@ export function EditorApp() {
     { id: "adjust", label: "Anpassen", disabled: !hasTarget },
     { id: "looks", label: "Looks", disabled: !hasTarget },
     { id: "props", label: "Eigenschaften" },
+    { id: "history", label: "Protokoll" },
   ]
-  const tab = !hasTarget && panelTab !== "props" ? "props" : panelTab
+  const tab = !hasTarget && (panelTab === "adjust" || panelTab === "looks") ? "props" : panelTab
 
   return (
     <div className="fixed inset-0 flex flex-col bg-[oklch(0.12_0.006_285)] text-foreground">
@@ -385,7 +413,7 @@ export function EditorApp() {
                       setMobileLayers(false)
                     }}
                     className={cn(
-                      "h-7 rounded-md px-2.5 text-[12px] font-medium text-muted-foreground transition hover:text-foreground disabled:opacity-35",
+                      "h-7 rounded-md px-2 text-[12px] font-medium text-muted-foreground transition hover:text-foreground disabled:opacity-35",
                       tab === t.id && !mobileLayers && "bg-muted text-foreground",
                       tab === t.id && mobileLayers && "md:bg-muted md:text-foreground",
                     )}
@@ -424,6 +452,7 @@ export function EditorApp() {
                 {tab === "adjust" && <AdjustPanel />}
                 {tab === "looks" && <LooksPanel />}
                 {tab === "props" && <PropertiesPanel />}
+                {tab === "history" && <HistoryPanel />}
               </div>
               <div className="flex h-[42%] min-h-56 shrink-0 flex-col border-t border-white/6 max-md:hidden">
                 <div className="flex h-8 shrink-0 items-center px-3 text-[11px] font-semibold tracking-[0.08em] text-muted-foreground uppercase">
@@ -443,6 +472,7 @@ export function EditorApp() {
       <ExportDialog open={exportOpen} onOpenChange={setExportOpen} initial={exportInit} />
       <NewDocDialog open={newOpen} onOpenChange={setNewOpen} />
       <ContextMenuHost />
+      <ShortcutsDialog open={helpOpen} onOpenChange={setHelpOpen} />
     </div>
   )
 }
@@ -454,6 +484,10 @@ const TOOL_HINT: Partial<Record<string, string>> = {
   eraser: "Radiert auf der aktiven Ebene oder dem Hintergrund",
   text: "Klicken und tippen · Esc = fertig",
   crop: "Rahmen anpassen · Enter übernimmt · Esc bricht ab",
+  gradient: "Ziehen = Verlauf · Shift = 45° · erneut G = Farbeimer",
+  bucket: "Klick = ähnliche Fläche füllen · Alt+Klick = Farbe aufnehmen",
+  clone: "Alt+Klick = Quelle · malen = kopieren · [ ] Größe",
+  heal: "Über Störendes malen – loslassen repariert",
 }
 
 function StatusBar() {
@@ -502,6 +536,10 @@ async function applyPreset(
       for (const [k, v] of Object.entries(p.adjust!)) (d.adjustments as unknown as Record<string, unknown>)[k] = v
     })
   if (p.autoFaces) await autoDetectFaces()
+  if (p.removeBg) {
+    s.select(BASE_ID)
+    await removeBackground()
+  }
   if (p.invertBlur) toast.info("Male über dein Motiv – alles andere wird weichgezeichnet.")
   if (p.openExport) {
     setInit(p.openExport)

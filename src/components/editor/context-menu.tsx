@@ -20,13 +20,14 @@ import {
   pasteLayer,
   privacyFromSelection,
   rasterizeLayer,
+  removeBackground,
   selectAll,
 } from "@/lib/editor/ops"
 import { EFFECT_LABEL } from "@/lib/editor/defaults"
 import { BASE_ID, type EffectKind } from "@/lib/editor/types"
 import { cn } from "@/lib/utils"
 
-export type ContextKind = "brush" | "eraser" | "privacy-brush" | "layer" | "base" | "selection" | "canvas"
+export type ContextKind = "brush" | "eraser" | "stamp" | "privacy-brush" | "layer" | "base" | "selection" | "canvas"
 export interface ContextRequest {
   x: number
   y: number
@@ -101,8 +102,8 @@ export function ContextMenuHost() {
       className="fixed z-[60] max-h-[calc(100vh-16px)] min-w-56 overflow-y-auto rounded-lg bg-popover p-1 text-popover-foreground shadow-xl ring-1 ring-foreground/10 animate-in fade-in-0 zoom-in-95 duration-100"
       style={pos ?? { left: req.x, top: req.y, visibility: "hidden" }}
     >
-      {req.kind === "brush" || req.kind === "eraser" ? (
-        <BrushMenu eraser={req.kind === "eraser"} />
+      {req.kind === "brush" || req.kind === "eraser" || req.kind === "stamp" ? (
+        <BrushMenu eraser={req.kind === "eraser"} stamp={req.kind === "stamp"} />
       ) : req.kind === "privacy-brush" ? (
         <PrivacyBrushMenu />
       ) : (
@@ -168,6 +169,7 @@ function itemsFor(kind: ContextKind): Item[] {
       { label: "Anpassungen …", run: () => s.setPanelTab("adjust") },
       { label: "Looks & Filter …", run: () => s.setPanelTab("looks") },
       { label: "Auto-Verbessern", kbd: "⇧Strg+L", run: autoEnhance },
+      { label: "Hintergrund entfernen (Person)", run: () => void removeBackground() },
       "-",
       { label: "Ebene durch Kopie", kbd: "Strg+J", run: () => void copyToNewLayer() },
       { label: "Neue Ebene", kbd: "⇧Strg+N", run: newLayer },
@@ -195,7 +197,12 @@ function itemsFor(kind: ContextKind): Item[] {
       { label: "Schrittweise rückwärts", kbd: "Strg+[", run: () => s.moveLayer(l.id, -1) },
       { label: "In den Hintergrund", kbd: "⇧Strg+[", run: () => s.moveLayer(l.id, "bottom") },
       "-",
-      ...(l.type === "image" ? [{ label: "Horizontal spiegeln", run: () => flipLayer("h") } as Item] : []),
+      ...(l.type === "image"
+        ? [
+            { label: "Horizontal spiegeln", run: () => flipLayer("h") } as Item,
+            { label: "Hintergrund entfernen (Person)", run: () => void removeBackground() } as Item,
+          ]
+        : []),
       { label: "Ebene rastern", run: () => void rasterizeLayer(l.id), disabled: isEffect || l.type === "image" },
       { label: "Auf eine Ebene reduzieren", kbd: "Strg+E", run: () => void mergeDown() },
       { label: l.locked ? "Entsperren" : "Sperren", run: () => s.updateLayer(l.id, { locked: !l.locked }) },
@@ -214,9 +221,10 @@ function itemsFor(kind: ContextKind): Item[] {
   ]
 }
 
-function BrushMenu({ eraser }: { eraser: boolean }) {
-  const set = useEditor((s) => (eraser ? s.eraser : s.brush))
-  const update = useEditor((s) => (eraser ? s.setEraser : s.setBrush))
+function BrushMenu({ eraser, stamp }: { eraser: boolean; stamp?: boolean }) {
+  const set = useEditor((s) => (stamp ? s.stamp : eraser ? s.eraser : s.brush))
+  const update = useEditor((s) => (stamp ? s.setStamp : eraser ? s.setEraser : s.setBrush))
+  const toolName = useEditor((s) => (s.tool === "heal" ? "Reparatur-Pinsel" : s.tool === "clone" ? "Kopierstempel" : null))
   const fg = useEditor((s) => s.fg)
   const setColors = useEditor((s) => s.setColors)
   const target = useEditor((s) => (s.selectedId === BASE_ID ? "Hintergrund" : (s.doc.layers.find((l) => l.id === s.selectedId)?.name ?? null)))
@@ -225,9 +233,9 @@ function BrushMenu({ eraser }: { eraser: boolean }) {
       <div className="flex items-center justify-between">
         <span className="flex items-center gap-1.5 text-[12px] font-semibold">
           {eraser ? <Eraser className="size-3.5" /> : <Brush className="size-3.5" />}
-          {eraser ? "Radierer" : "Pinsel"}
+          {stamp ? toolName : eraser ? "Radierer" : "Pinsel"}
         </span>
-        {!eraser && <ColorPicker size="sm" label="Pinselfarbe" value={fg} onChange={(c) => c && setColors({ fg: c })} />}
+        {!eraser && !stamp && <ColorPicker size="sm" label="Pinselfarbe" value={fg} onChange={(c) => c && setColors({ fg: c })} />}
       </div>
       {/* live preview of the brush tip */}
       <div className="grid h-20 place-items-center rounded-md bg-black/40 ring-1 ring-white/5">

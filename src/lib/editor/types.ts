@@ -118,6 +118,20 @@ export interface Stroke {
   poly?: boolean
   /** with poly: fill everything except the polygon (inverted selection) */
   invert?: boolean
+  /** raster stamp: asset id; points = [TL x,y, TR x,y, BL x,y] of the target quad */
+  raster?: string
+  /** selection the stroke is clipped to (polygon in doc px) */
+  clip?: number[]
+  clipInvert?: boolean
+}
+
+/** destructive-style filters, kept editable per layer */
+export interface Filters {
+  blur?: number // px
+  pixelate?: number // block size px
+  posterize?: number // levels (2..32), 0 = off
+  noise?: number // 0..100
+  invert?: boolean
 }
 
 interface LayerBase {
@@ -134,6 +148,7 @@ interface LayerBase {
   /** per-layer look preset */
   look?: string | null
   lookAmount?: number
+  filters?: Filters
 }
 
 export interface ImageLayer extends LayerBase {
@@ -186,7 +201,7 @@ export interface ShapeLayer extends LayerBase {
   radius: number
 }
 
-export type EffectKind = "blur" | "pixelate" | "redact" | "noise" | "glass"
+export type EffectKind = "blur" | "pixelate" | "redact" | "noise" | "glass" | "clone"
 export type RegionShape = "rect" | "ellipse" | "brush"
 
 /** A privacy / effect region that alters everything beneath it. */
@@ -206,6 +221,25 @@ export interface EffectLayer extends LayerBase {
   color: string // redact color
   /** invert = apply everywhere except region (e.g. background blur) */
   invert: boolean
+  /** clone stamp: source offset (source − destination) in doc px */
+  dx?: number
+  dy?: number
+}
+
+/** colour / gradient fill layer (Photoshop "Füllebene") */
+export interface FillLayer extends LayerBase {
+  type: "fill"
+  fill: "solid" | "linear" | "radial"
+  color: string
+  /** second colour; "transparent" fades out */
+  color2: string
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  /** optional selection the fill is limited to */
+  clip?: number[]
+  clipInvert?: boolean
 }
 
 export interface DrawLayer extends LayerBase {
@@ -213,7 +247,7 @@ export interface DrawLayer extends LayerBase {
   strokes: (Stroke & { color: string })[]
 }
 
-export type Layer = ImageLayer | TextLayer | ShapeLayer | EffectLayer | DrawLayer
+export type Layer = ImageLayer | TextLayer | ShapeLayer | EffectLayer | DrawLayer | FillLayer
 
 export interface SheepDoc {
   version: 1
@@ -234,6 +268,8 @@ export interface SheepDoc {
   baseHidden?: boolean
   /** erase operations on the background photo */
   baseMask?: Stroke[]
+  /** filters on the background photo */
+  filters?: Filters
 }
 
 export interface Asset {
@@ -252,6 +288,10 @@ export type ToolId =
   | "eyedropper"
   | "brush"
   | "eraser"
+  | "gradient"
+  | "bucket"
+  | "clone"
+  | "heal"
   | "text"
   | "shapes"
   | "privacy"

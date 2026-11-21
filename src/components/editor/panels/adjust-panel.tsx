@@ -9,7 +9,7 @@ import { Histogram, computeHistogram } from "../histogram"
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 import { useEditor } from "@/lib/editor/store"
-import { HSL_CHANNELS, type Adjustments, type HslChannel } from "@/lib/editor/types"
+import { HSL_CHANNELS, type Adjustments, type Filters, type HslChannel } from "@/lib/editor/types"
 import { renderDoc, invalidateRenderCache, docSize } from "@/lib/editor/render"
 import { currentTarget, patchDevelop, readDevelop, targetOf, type AdjTarget } from "@/lib/editor/target"
 import { defaultAdjustments } from "@/lib/editor/defaults"
@@ -285,6 +285,34 @@ export function AdjustPanel() {
         <S k="grainSize" label="Korngröße" min={0} max={100} neutral={25} />
         <S k="fade" label="Verblassen" min={0} max={100} />
       </Section>
+
+      <FilterSection target={target} />
+    </div>
+  )
+}
+
+/** Filter (Weichzeichnen, Verpixeln, Tontrennung, Rauschen, Umkehren) for the current target. */
+function FilterSection({ target }: { target: AdjTarget }) {
+  const doc = useEditor((s) => s.doc)
+  const f = readDevelop(doc, target).filters
+  const set = (p: Partial<Filters>, key: string) => patchDevelop(target, (d) => void (d.filters = { ...d.filters, ...p }), `filter:${key}`)
+  const tick = useEditor((s) => s.filterTick)
+  const ref = React.useRef<HTMLDivElement>(null)
+  React.useEffect(() => {
+    if (tick) ref.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [tick])
+  return (
+    <div ref={ref} key={tick}>
+    <Section title="Filter" defaultOpen={tick > 0}>
+      <AdjustSlider label="Gaußscher Weichzeichner" value={f.blur ?? 0} min={0} max={80} onChange={(v) => set({ blur: v }, "blur")} format={(v) => `${Math.round(v)} px`} />
+      <AdjustSlider label="Mosaik (Verpixeln)" value={f.pixelate ?? 0} min={0} max={120} onChange={(v) => set({ pixelate: v }, "pixelate")} format={(v) => `${Math.round(v)} px`} />
+      <AdjustSlider label="Tontrennung" value={f.posterize ?? 0} min={0} max={16} onChange={(v) => set({ posterize: v < 2 ? 0 : v }, "posterize")} format={(v) => (v < 2 ? "Aus" : `${Math.round(v)} Stufen`)} />
+      <AdjustSlider label="Rauschen hinzufügen" value={f.noise ?? 0} min={0} max={100} onChange={(v) => set({ noise: v }, "noise")} />
+      <div className="mt-2 flex items-center justify-between text-[12px]">
+        <span className="text-muted-foreground">Umkehren (Negativ)</span>
+        <Switch checked={!!f.invert} onCheckedChange={(v) => set({ invert: v }, "invert")} aria-label="Umkehren" />
+      </div>
+    </Section>
     </div>
   )
 }

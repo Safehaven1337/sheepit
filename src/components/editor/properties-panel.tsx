@@ -120,6 +120,49 @@ export function PropertiesPanel() {
         </Section>
       )}
 
+      {l.type === "fill" && (
+        <Section title="Füllung">
+          <div className="mb-2 grid grid-cols-3 gap-1">
+            {(["solid", "linear", "radial"] as const).map((k) => (
+              <button
+                key={k}
+                type="button"
+                onClick={() => u({ fill: k } as Partial<Layer>)}
+                className={cn("h-7 rounded-md bg-muted/60 text-[11px] text-muted-foreground hover:text-foreground", l.fill === k && "bg-primary/15 text-primary")}
+              >
+                {{ solid: "Farbe", linear: "Linear", radial: "Radial" }[k]}
+              </button>
+            ))}
+          </div>
+          <Row label={l.fill === "solid" ? "Farbe" : "Startfarbe"}>
+            <ColorPicker label="Farbe" value={l.color} onChange={(c) => c && u({ color: c } as Partial<Layer>)} />
+          </Row>
+          {l.fill !== "solid" && (
+            <Row label="Endfarbe">
+              <ColorPicker
+                label="Endfarbe (Keine = transparent)"
+                allowNone
+                value={l.color2 === "transparent" ? null : l.color2}
+                onChange={(c) => u({ color2: c ?? "transparent" } as Partial<Layer>)}
+              />
+            </Row>
+          )}
+          {l.fill !== "solid" && (
+            <Button
+              size="sm"
+              variant="secondary"
+              className="mt-2"
+              onClick={() =>
+                l.color2 !== "transparent" && u({ color: l.color2, color2: l.color } as Partial<Layer>)
+              }
+            >
+              Farben tauschen
+            </Button>
+          )}
+          <p className="mt-2 text-[11px] text-muted-foreground">Richtung ändern: mit dem Verlaufswerkzeug (G) neu ziehen.</p>
+        </Section>
+      )}
+
       {l.type === "effect" && (
         <Section title="Unkenntlich machen">
           <div className="mb-2 grid grid-cols-5 gap-1">
@@ -165,4 +208,4 @@ function Row({ label, children }: { label: string; children: React.ReactNode }) 
 }
 
 const typeLabel = (l: Layer) =>
-  ({ image: "Bildebene", text: "Textebene", shape: "Formebene", effect: "Unkenntlich-Ebene", draw: "Pixelebene" })[l.type]
+  ({ image: "Bildebene", text: "Textebene", shape: "Formebene", effect: "Unkenntlich-Ebene", draw: "Pixelebene", fill: "Füllebene" })[l.type]

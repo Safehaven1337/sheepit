@@ -4,6 +4,7 @@ export interface EditorPreset {
   tool: ToolId | "adjust" | "looks"
   privacy?: { effect?: "blur" | "pixelate" | "redact" | "noise" | "glass"; region?: "rect" | "ellipse" | "brush"; invert?: boolean }
   autoFaces?: boolean
+  removeBg?: boolean
   invertBlur?: boolean
   look?: string
   openExport?: { format?: "image/png" | "image/jpeg" | "image/webp"; quality?: number }
@@ -225,6 +226,60 @@ export const TOOLS: ToolPage[] = [
     ],
     preset: { tool: "privacy", privacy: { effect: "redact", region: "rect" } },
     related: ["foto-unkenntlich-machen", "bild-verpixeln", "png-in-jpg-umwandeln"],
+  },
+  {
+    slug: "hintergrund-entfernen",
+    label: "Hintergrund entfernen",
+    category: "Bearbeiten",
+    title: "Hintergrund entfernen – Personen freistellen, kostenlos & ohne Upload",
+    h1: "Hintergrund entfernen mit einem Klick",
+    highlight: "Hintergrund",
+    description:
+      "Hintergrund aus Fotos entfernen und Personen freistellen – mit KI direkt im Browser, ohne Upload, ohne Anmeldung. Als transparentes PNG speichern.",
+    keywords: ["hintergrund entfernen", "bild freistellen", "person freistellen", "hintergrund transparent machen", "png ohne hintergrund"],
+    lead: "Die KI erkennt Personen auf deinem Gerät und entfernt alles dahinter. Ränder mit dem Radierer nachbessern, neuen Hintergrund als Ebene darunter legen, als PNG exportieren.",
+    steps: [
+      { title: "Foto öffnen", text: "Porträt oder Personenfoto in Sheepit ziehen – es wird nicht hochgeladen." },
+      { title: "Automatisch freistellen", text: "Der Hintergrund wird sofort entfernt. Mit Radierer oder Strg+Z nachbessern." },
+      { title: "Als PNG speichern", text: "PNG behält die Transparenz – oder leg einen neuen Hintergrund (Farbe/Verlauf) darunter." },
+    ],
+    benefits: [
+      { title: "KI auf deinem Gerät", text: "Die Segmentierung läuft als WebAssembly im Browser. Dein Foto erreicht keinen Server." },
+      privacyBenefit,
+      { title: "Nicht-destruktiv", text: "Der Hintergrund wird nur maskiert – du kannst jederzeit zurück oder nachbessern." },
+    ],
+    faq: [
+      { q: "Funktioniert das mit jedem Motiv?", a: "Optimiert ist die Erkennung für Personen (Porträts, Selfies, Ganzkörper). Für Produkte oder Tiere eignen sich Auswahl-Werkzeuge und Radierer besser." },
+      { q: "Wie bekomme ich einen transparenten Hintergrund?", a: "Nach dem Entfernen als PNG oder WebP exportieren – beide Formate unterstützen Transparenz." },
+      { q: "Kann ich einen neuen Hintergrund einfügen?", a: "Ja: Neue Ebene, mit Farbeimer oder Verlauf füllen und unter die Person schieben – oder ein Bild als Ebene platzieren." },
+      { q: "Ist das wirklich kostenlos?", a: "Ja, ohne Limit, ohne Wasserzeichen und ohne Konto." },
+    ],
+    preset: { tool: "move", removeBg: true, openExport: { format: "image/png" } },
+    related: ["objekt-entfernen", "bild-zuschneiden", "png-in-jpg-umwandeln"],
+  },
+  {
+    slug: "objekt-entfernen",
+    label: "Objekt aus Foto entfernen",
+    category: "Verbessern",
+    title: "Objekt aus Foto entfernen – Retusche online, kostenlos",
+    h1: "Störende Objekte aus Fotos entfernen",
+    highlight: "entfernen",
+    description:
+      "Pickel, Flecken, Kabel, Schrift oder kleine Objekte aus Fotos entfernen: einfach drübermalen. Reparatur-Pinsel und Kopierstempel direkt im Browser – ohne Upload.",
+    keywords: ["objekt aus foto entfernen", "foto retuschieren", "pickel entfernen foto", "flecken entfernen bild", "kopierstempel online"],
+    lead: "Mit dem Reparatur-Pinsel malst du über das, was weg soll – Sheepit füllt die Stelle passend aus der Umgebung auf. Für Strukturen gibt es den Kopierstempel.",
+    steps: [
+      { title: "Foto öffnen", text: "Bild reinziehen – es bleibt auf deinem Gerät." },
+      { title: "Drübermalen", text: "Reparatur-Pinsel (J) wählen und über den Fleck oder das Objekt malen. Loslassen – weg." },
+      { title: "Feinschliff & Export", text: "Bei Mustern mit dem Kopierstempel (S, Alt+Klick = Quelle) nacharbeiten, dann speichern." },
+    ],
+    benefits: [privacyBenefit, freeBenefit, { title: "Nicht-destruktiv", text: "Retuschen landen auf einer eigenen Ebene – ein Klick aufs Auge zeigt das Original." }],
+    faq: [
+      { q: "Wie gut funktioniert das bei großen Objekten?", a: "Am besten bei kleinen bis mittleren Stellen auf ruhigem Hintergrund. Große, strukturierte Flächen lieber mit dem Kopierstempel bearbeiten." },
+      { q: "Was ist der Unterschied zum Kopierstempel?", a: "Der Reparatur-Pinsel rechnet die Fläche aus der Umgebung neu, der Kopierstempel kopiert exakt von einer Stelle, die du mit Alt+Klick wählst." },
+    ],
+    preset: { tool: "heal" },
+    related: ["hintergrund-entfernen", "bild-schaerfen", "foto-aufhellen"],
   },
   {
     slug: "bild-zuschneiden",

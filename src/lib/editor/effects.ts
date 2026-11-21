@@ -1,4 +1,4 @@
-import type { EffectLayer, Stroke } from "./types"
+import type { Asset, EffectLayer, Stroke } from "./types"
 
 export function makeCanvas(w: number, h: number) {
   const c = document.createElement("canvas")
@@ -64,11 +64,39 @@ export function strokeBounds(strokes: Stroke[]) {
  * Supports soft brushes (hardness), per-stroke opacity and filled polygons
  * (selection fill / delete, optionally inverted).
  */
-export function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, scale: number) {
+export function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, scale: number, assets?: Map<string, Asset>) {
   const p = s.points
   if (!p.length) return
   ctx.save()
   if (s.alpha !== undefined) ctx.globalAlpha *= s.alpha
+  if (s.clip?.length) {
+    // limit the stroke to the selection it was painted in
+    ctx.beginPath()
+    if (s.clipInvert) ctx.rect(-1e5, -1e5, 2e5, 2e5)
+    ctx.moveTo(s.clip[0] * scale, s.clip[1] * scale)
+    for (let i = 2; i < s.clip.length; i += 2) ctx.lineTo(s.clip[i] * scale, s.clip[i + 1] * scale)
+    ctx.closePath()
+    ctx.clip(s.clipInvert ? "evenodd" : "nonzero")
+  }
+  if (s.raster) {
+    const a = assets?.get(s.raster)
+    if (a && p.length >= 6) {
+      const iw = a.width
+      const ih = a.height
+      ctx.transform(
+        ((p[2] - p[0]) * scale) / iw,
+        ((p[3] - p[1]) * scale) / iw,
+        ((p[4] - p[0]) * scale) / ih,
+        ((p[5] - p[1]) * scale) / ih,
+        p[0] * scale,
+        p[1] * scale,
+      )
+      ctx.imageSmoothingQuality = "high"
+      ctx.drawImage(a.bitmap, 0, 0)
+    }
+    ctx.restore()
+    return
+  }
   if (s.poly) {
     ctx.beginPath()
     if (s.invert) ctx.rect(-1e5, -1e5, 2e5, 2e5)
@@ -116,19 +144,19 @@ export function drawStroke(ctx: CanvasRenderingContext2D, s: Stroke, scale: numb
 }
 
 /** Applies erase operations (layer mask) onto a buffer in place. */
-export function applyMask(ctx: CanvasRenderingContext2D, mask: Stroke[] | undefined, scale: number) {
+export function applyMask(ctx: CanvasRenderingContext2D, mask: Stroke[] | undefined, scale: number, assets?: Map<string, Asset>) {
   if (!mask?.length) return
   ctx.save()
   ctx.setTransform(1, 0, 0, 1, 0, 0)
   ctx.globalCompositeOperation = "destination-out"
   ctx.fillStyle = "#000"
   ctx.strokeStyle = "#000"
-  for (const m of mask) drawStroke(ctx, m, scale)
+  for (const m of mask) drawStroke(ctx, m, scale, assets)
   ctx.restore()
 }
 
 /** Paints the effect region mask (white = affected) into a full-size canvas. */
-export function buildMask(layer: EffectLayer, b: { x: number; y: number; w: number; h: number }, scale: number) {
+export function buildMask(layer: EffectLayer, b: { x: number; y: number; w: number; h: number }, scale: number, assets?: Map<string, Asset>) {
   const W = b.w
   const H = b.h
   const m = makeCanvas(W, H)
@@ -153,7 +181,7 @@ export function buildMask(layer: EffectLayer, b: { x: number; y: number; w: numb
   } else {
     for (const s of layer.strokes) {
       c.globalCompositeOperation = s.erase ? "destination-out" : "source-over"
-      drawStroke(c, s, scale)
+      drawStroke(c, s, scale, assets)
     }
     c.globalCompositeOperation = "source-over"
   }
@@ -204,7 +232,7 @@ function rand(seed: number) {
 }
 
 /** Applies a privacy/effect layer onto the composite (in place). */
-export function applyEffect(target: HTMLCanvasElement, layer: EffectLayer, scale: number) {
+export function applyEffect(target: HTMLCanvasElement, layer: EffectLayer, scale: number, assets?: Map<string, Asset>) {
   const W = target.width
   const H = target.height
   const b = regionBounds(layer, W, H, scale)
@@ -219,6 +247,9 @@ export function applyEffect(target: HTMLCanvasElement, layer: EffectLayer, scale
   if (layer.effect === "redact") {
     f.fillStyle = layer.color
     f.fillRect(0, 0, b.w, b.h)
+  } else if (layer.effect === "clone") {
+    // copy pixels from the source offset (Kopierstempel)
+    f.drawImage(target, -b.x - (layer.dx ?? 0) * scale, -b.y - (layer.dy ?? 0) * scale)
   } else if (layer.effect === "pixelate") {
     const px = Math.max(2, amt)
     // align grid to document origin so blocks don't swim when moving
@@ -287,7 +318,7 @@ export function applyEffect(target: HTMLCanvasElement, layer: EffectLayer, scale
   }
 
   // mask it
-  const mask = buildMask(layer, b, scale)
+  const mask = buildMask(layer, b, scale, assets)
   f.globalCompositeOperation = "destination-in"
   f.drawImage(mask, 0, 0)
   f.globalCompositeOperation = "source-over"

@@ -28,12 +28,15 @@ import {
   pasteLayer,
   privacyFromSelection,
   rasterizeLayer,
+  removeBackground,
   selectAll,
 } from "@/lib/editor/ops"
+import { currentTarget, patchDevelop } from "@/lib/editor/target"
+import type { Filters } from "@/lib/editor/types"
 import { autoEnhance } from "./panels/adjust-panel"
 import { BASE_ID } from "@/lib/editor/types"
 
-export type UiCommand = "new" | "open" | "place" | "save" | "export" | "close"
+export type UiCommand = "new" | "open" | "place" | "save" | "export" | "close" | "help"
 export const ui = (cmd: UiCommand) => window.dispatchEvent(new CustomEvent("sheepit:ui", { detail: cmd }))
 
 type Item = { label: string; kbd?: string; run: () => void; disabled?: boolean } | "-" | { sub: string; items: Item[] }
@@ -78,6 +81,7 @@ export function MenuBar() {
   const canUndo = useEditor((s) => s.past.length > 0)
   const canRedo = useEditor((s) => s.future.length > 0)
   const clip = useEditor((s) => !!s.clipboard)
+  const showGrid = useEditor((s) => s.showGrid)
   const st = useEditor.getState
   const z = () => st().zoom || st().fitZoom
 
@@ -114,6 +118,8 @@ export function MenuBar() {
     { label: "Horizontal spiegeln", run: () => flip("h"), disabled: !hasPhoto },
     { label: "Vertikal spiegeln", run: () => flip("v"), disabled: !hasPhoto },
     "-",
+    { label: "Hintergrund entfernen (Person)", run: () => void removeBackground(), disabled: !ready },
+    "-",
     { label: "Freistellen-Werkzeug", kbd: "C", run: () => switchTool("crop"), disabled: !hasPhoto },
     { label: "Auf Auswahl freistellen", run: cropToSelection, disabled: !hasSel },
   ]
@@ -145,11 +151,44 @@ export function MenuBar() {
     { label: "Auswahl unkenntlich machen", run: privacyFromSelection, disabled: !hasSel },
     { label: "Gesichter automatisch finden", run: () => void autoDetectFaces(), disabled: !hasPhoto },
   ]
+  const setFilter = (p: Partial<Filters>) => {
+    const t = currentTarget()
+    if (!t) return
+    patchDevelop(t, (d) => void (d.filters = { ...d.filters, ...p }))
+    st().openFilters()
+  }
+  const filter: Item[] = [
+    { label: "Gaußscher Weichzeichner …", run: () => setFilter({ blur: 6 }), disabled: !ready },
+    { label: "Mosaik (Verpixeln) …", run: () => setFilter({ pixelate: 16 }), disabled: !ready },
+    { label: "Tontrennung …", run: () => setFilter({ posterize: 5 }), disabled: !ready },
+    { label: "Rauschen hinzufügen …", run: () => setFilter({ noise: 20 }), disabled: !ready },
+    { label: "Umkehren", kbd: "Strg+I", run: () => {
+      const t = currentTarget()
+      if (t) patchDevelop(t, (d) => void (d.filters = { ...d.filters, invert: !d.filters.invert }))
+    }, disabled: !ready },
+    "-",
+    { label: "Schwarz-Weiß", run: () => {
+      const t = currentTarget()
+      if (t) patchDevelop(t, (d) => void (d.adjustments = { ...d.adjustments, monochrome: !d.adjustments.monochrome }))
+    }, disabled: !ready },
+    { label: "Scharfzeichnen", run: () => {
+      const t = currentTarget()
+      if (t) patchDevelop(t, (d) => void (d.adjustments = { ...d.adjustments, sharpen: Math.min(150, d.adjustments.sharpen + 40) }))
+    }, disabled: !ready },
+    "-",
+    { label: "Alle Filter dieser Ebene …", run: () => st().openFilters(), disabled: !ready },
+  ]
+  const help: Item[] = [
+    { label: "Tastenkürzel", kbd: "?", run: () => ui("help") },
+  ]
   const view: Item[] = [
     { label: "Einzoomen", kbd: "Strg++", run: () => st().setZoom(z() * 1.25), disabled: !ready },
     { label: "Auszoomen", kbd: "Strg+-", run: () => st().setZoom(z() / 1.25), disabled: !ready },
     { label: "Ganzes Bild", kbd: "Strg+0", run: () => st().setZoom(0), disabled: !ready },
     { label: "100 %", kbd: "Strg+1", run: () => st().setZoom(1), disabled: !ready },
+    "-",
+    { label: showGrid ? "Raster ausblenden" : "Raster einblenden", kbd: "Strg+#", run: () => st().setShowGrid(!showGrid), disabled: !ready },
+    { label: "Protokoll", run: () => st().setPanelTab("history"), disabled: !ready },
   ]
 
   return (
@@ -159,7 +198,9 @@ export function MenuBar() {
       <Menu label="Bild" items={image} />
       <Menu label="Ebene" items={layer} />
       <Menu label="Auswahl" items={select} />
+      <Menu label="Filter" items={filter} />
       <Menu label="Ansicht" items={view} />
+      <Menu label="Hilfe" items={help} />
     </nav>
   )
 }

@@ -1,11 +1,24 @@
 "use client"
 
 import { create } from "zustand"
+import { produce, setAutoFreeze } from "immer"
+import { describeChange } from "./history"
 import { emptyDoc, defaultAdjustments, uid } from "./defaults"
 import { remapBaseMask, remapMask } from "./render"
 import type { Asset, EffectKind, Layer, RegionShape, SelectionShape, SheepDoc, TextLayer, ToolId } from "./types"
 
 const MAX_HISTORY = 100
+
+// Structural sharing: untouched layers/strokes keep their identity between
+// history steps, which lets the renderer cache them. Objects stay mutable for
+// existing code paths that clone-and-modify.
+setAutoFreeze(false)
+
+export interface HistoryEntry {
+  doc: SheepDoc
+  /** name of the action that produced this state */
+  label: string
+}
 
 export interface PrivacySettings {
   effect: EffectKind
@@ -35,13 +48,21 @@ export interface ShapeStyle {
   radius: number
 }
 
-export type PanelTab = "adjust" | "looks" | "props"
+export type PanelTab = "adjust" | "looks" | "props" | "history"
+
+export interface GradientSettings {
+  type: "linear" | "radial"
+  /** fg → bg or fg → transparent */
+  to: "bg" | "transparent"
+}
 
 interface EditorState {
   doc: SheepDoc
   assets: Map<string, Asset>
-  past: SheepDoc[]
-  future: SheepDoc[]
+  past: HistoryEntry[]
+  future: HistoryEntry[]
+  /** name of the action that produced the current doc */
+  currentLabel: string
   lastKey: string | null
   lastTime: number
   dirty: boolean
@@ -59,6 +80,17 @@ interface EditorState {
   bg: string
   brush: BrushSettings
   eraser: BrushSettings
+  /** clone stamp & healing brush */
+  stamp: BrushSettings
+  gradient: GradientSettings
+  bucketTolerance: number
+  /** clone stamp: source point (doc px) and aligned offset */
+  cloneSource: { x: number; y: number } | null
+  cloneOffset: { dx: number; dy: number } | null
+  showGrid: boolean
+  /** bumps to open/scroll to the filter section */
+  filterTick: number
+  openFilters: () => void
   privacy: PrivacySettings
   crop: CropDraft
   shapeKind: "rect" | "ellipse" | "line" | "arrow"
@@ -83,6 +115,12 @@ interface EditorState {
   setColors: (p: { fg?: string; bg?: string }) => void
   setBrush: (p: Partial<BrushSettings>) => void
   setEraser: (p: Partial<BrushSettings>) => void
+  setStamp: (p: Partial<BrushSettings>) => void
+  setGradient: (p: Partial<GradientSettings>) => void
+  setBucketTolerance: (v: number) => void
+  setCloneSource: (p: { x: number; y: number } | null) => void
+  setCloneOffset: (o: { dx: number; dy: number } | null) => void
+  setShowGrid: (v: boolean) => void
   setPrivacy: (p: Partial<PrivacySettings>) => void
   setCrop: (p: Partial<CropDraft>) => void
   setShapeKind: (k: EditorState["shapeKind"]) => void
@@ -105,6 +143,8 @@ interface EditorState {
   reorderLayer: (id: string, toIndex: number) => void
   undo: () => void
   redo: () => void
+  /** jump to a history index (0 = oldest state) */
+  jumpTo: (index: number) => void
 
   addAsset: (blob: Blob) => Promise<Asset>
   openImage: (blob: Blob, name?: string) => Promise<void>
@@ -129,8 +169,9 @@ function validSelection(doc: SheepDoc, id: string | null) {
 }
 
 const fresh = {
-  past: [] as SheepDoc[],
-  future: [] as SheepDoc[],
+  past: [] as HistoryEntry[],
+  future: [] as HistoryEntry[],
+  currentLabel: "Öffnen",
   selectedId: null,
   zoom: 0,
   dirty: false,
@@ -154,6 +195,14 @@ export const useEditor = create<EditorState>((set, get) => ({
   bg: "#ffffff",
   brush: { size: 24, hardness: 0.8, opacity: 1 },
   eraser: { size: 40, hardness: 0.6, opacity: 1 },
+  stamp: { size: 40, hardness: 0.5, opacity: 1 },
+  gradient: { type: "linear", to: "bg" },
+  bucketTolerance: 32,
+  cloneSource: null,
+  cloneOffset: null,
+  showGrid: false,
+  filterTick: 0,
+  openFilters: () => set((s) => ({ filterTick: s.filterTick + 1, panelTab: "adjust" })),
   privacy: { effect: "pixelate", region: "rect", brushSize: 60, erase: false },
   crop: { aspect: null, rect: null },
   shapeKind: "rect",
@@ -178,6 +227,12 @@ export const useEditor = create<EditorState>((set, get) => ({
   setColors: (p) => set((s) => ({ fg: p.fg ?? s.fg, bg: p.bg ?? s.bg })),
   setBrush: (p) => set((s) => ({ brush: { ...s.brush, ...p } })),
   setEraser: (p) => set((s) => ({ eraser: { ...s.eraser, ...p } })),
+  setStamp: (p) => set((s) => ({ stamp: { ...s.stamp, ...p } })),
+  setGradient: (p) => set((s) => ({ gradient: { ...s.gradient, ...p } })),
+  setBucketTolerance: (bucketTolerance) => set({ bucketTolerance }),
+  setCloneSource: (cloneSource) => set({ cloneSource, cloneOffset: null }),
+  setCloneOffset: (cloneOffset) => set({ cloneOffset }),
+  setShowGrid: (showGrid) => set({ showGrid }),
   setPrivacy: (p) => set((s) => ({ privacy: { ...s.privacy, ...p } })),
   setCrop: (p) => set((s) => ({ crop: { ...s.crop, ...p } })),
   setShapeKind: (shapeKind) => set({ shapeKind }),
@@ -192,14 +247,20 @@ export const useEditor = create<EditorState>((set, get) => ({
 
   patch: (recipe, key) => {
     const s = get()
-    const next = structuredClone(s.doc)
-    recipe(next)
-    if (next.baseMask?.length) next.baseMask = remapBaseMask(s.doc, next)
+    const next = produce(s.doc, (d) => {
+      recipe(d)
+      if (d.baseMask?.length) {
+        const remapped = remapBaseMask(s.doc, d as SheepDoc, d.baseMask)
+        if (remapped !== d.baseMask) d.baseMask = remapped
+      }
+    })
+    if (next === s.doc) return
     const now = performance.now()
-    const coalesce = key && key === s.lastKey && now - s.lastTime < 700
+    const coalesce = !!key && key === s.lastKey && now - s.lastTime < 700
     set({
       doc: next,
-      past: coalesce ? s.past : [...s.past.slice(-MAX_HISTORY), s.doc],
+      past: coalesce ? s.past : [...s.past.slice(-MAX_HISTORY), { doc: s.doc, label: s.currentLabel }],
+      currentLabel: coalesce ? s.currentLabel : describeChange(s.doc, next),
       future: [],
       lastKey: key ?? null,
       lastTime: now,
@@ -265,32 +326,23 @@ export const useEditor = create<EditorState>((set, get) => ({
       d.layers.splice(Math.max(0, Math.min(d.layers.length, toIndex)), 0, l)
     }),
 
-  undo: () => {
+  undo: () => get().jumpTo(get().past.length - 1),
+  redo: () => get().jumpTo(get().past.length + 1),
+
+  jumpTo: (index) => {
     const s = get()
-    const prev = s.past[s.past.length - 1]
-    if (!prev) return
+    const all: HistoryEntry[] = [...s.past, { doc: s.doc, label: s.currentLabel }, ...s.future]
+    if (index < 0 || index >= all.length || index === s.past.length) return
+    const cur = all[index]
     set({
-      doc: prev,
-      past: s.past.slice(0, -1),
-      future: [s.doc, ...s.future],
+      doc: cur.doc,
+      currentLabel: cur.label,
+      past: all.slice(0, index),
+      future: all.slice(index + 1),
       lastKey: null,
       dirty: true,
       editingText: null,
-      selectedId: validSelection(prev, s.selectedId),
-    })
-  },
-  redo: () => {
-    const s = get()
-    const next = s.future[0]
-    if (!next) return
-    set({
-      doc: next,
-      past: [...s.past, s.doc],
-      future: s.future.slice(1),
-      lastKey: null,
-      dirty: true,
-      editingText: null,
-      selectedId: validSelection(next, s.selectedId),
+      selectedId: validSelection(cur.doc, s.selectedId),
     })
   },
 
@@ -321,6 +373,7 @@ export const useEditor = create<EditorState>((set, get) => ({
       doc: { ...emptyDoc(), name, sourceWidth: w, sourceHeight: h, background: bg },
       assets: new Map(),
       ...fresh,
+      currentLabel: "Neu",
       ready: true,
       tool: "text",
     })
